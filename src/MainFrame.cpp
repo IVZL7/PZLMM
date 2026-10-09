@@ -2,27 +2,252 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <condition_variable>
+#include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <exception>
+#include <fstream>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <utility>
 #include <map>
+#include <mutex>
+#include <thread>
 
 #include <wx/dirdlg.h>
+#include <wx/filedlg.h>
 #include <wx/filefn.h>
+#include <wx/mstream.h>
 #include <wx/utils.h>
 #include <wx/wfstream.h>
 #include <wx/zipstrm.h>
+#include <wx/stdpaths.h>
 
 wxDEFINE_EVENT(wxEVT_PZMM_JOB_DONE, wxThreadEvent);
 wxDEFINE_EVENT(wxEVT_PZMM_PROGRESS, wxThreadEvent);
 
 namespace {
 
+constexpr const char* kModArchiveMarkerPath = "__PZModManagerArchive.txt";
+constexpr const char* kModArchiveMarkerText = "PZModManager mod archive v1\n";
+
+std::string ToUtf8(const wxString& value);
+wxString PathToWx(const pzmm::fs::path& path);
+std::string LowerFilterText(std::string value);
+std::vector<std::string> NumericVersionParts(const std::string& value);
+
 wxString FromUtf8(const std::string& value) {
     return wxString::FromUTF8(value.c_str());
+}
+
+std::optional<int> CompareImportModVersions(const std::string& imported, const std::string& installed) {
+    const std::string left = LowerFilterText(imported);
+    const std::string right = LowerFilterText(installed);
+    if (left.empty() || right.empty()) return std::nullopt;
+    if (left == right) return 0;
+    const auto leftParts = NumericVersionParts(left);
+    const auto rightParts = NumericVersionParts(right);
+    if (leftParts.empty() || rightParts.empty()) return std::nullopt;
+
+    const size_t count = std::max(leftParts.size(), rightParts.size());
+    for (size_t i = 0; i < count; ++i) {
+        std::string a = i < leftParts.size() ? leftParts[i] : "0";
+        std::string b = i < rightParts.size() ? rightParts[i] : "0";
+        const auto aFirst = a.find_first_not_of('0');
+        const auto bFirst = b.find_first_not_of('0');
+        a = aFirst == std::string::npos ? "0" : a.substr(aFirst);
+        b = bFirst == std::string::npos ? "0" : b.substr(bFirst);
+        if (a.size() != b.size()) return a.size() < b.size() ? -1 : 1;
+        if (a != b) return a < b ? -1 : 1;
+    }
+    return 0;
+}
+
+struct ArchiveInspection {
+    bool marked = false;
+    std::map<std::string, std::string> modRoots;
+    std::string error;
+};
+
+bool NormalizeZipEntryName(std::string& name) {
+    std::replace(name.begin(), name.end(), '\\', '/');
+    if (name.empty() || name.front() == '/' || name.find(':') != std::string::npos) return false;
+    size_t start = 0;
+    while (start <= name.size()) {
+        const size_t end = name.find('/', start);
+        const std::string component = name.substr(start, end == std::string::npos ? end : end - start);
+        if (component == ".." || component == ".") return false;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    while (!name.empty() && name.back() == '/') name.pop_back();
+    return !name.empty();
+}
+
+bool LooksLikeModInfoPath(const std::string& relativePath) {
+    const std::string lower = LowerFilterText(relativePath);
+    return lower == "mod.info" || (lower.size() >= 9 && lower.compare(lower.size() - 9, 9, "/mod.info") == 0);
+}
+
+std::string ModRootForInfoEntry(const std::string& name) {
+    std::vector<std::string> components;
+    size_t start = 0;
+    while (start <= name.size()) {
+        const size_t end = name.find('/', start);
+        components.push_back(name.substr(start, end == std::string::npos ? end : end - start));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (components.empty() || LowerFilterText(components.back()) != "mod.info") return {};
+    components.pop_back();
+    while (components.size() > 1) {
+        const auto& last = components.back();
+        const bool versionFolder = !last.empty() &&
+            std::all_of(last.begin(), last.end(), [](unsigned char ch) { return std::isdigit(ch) || ch == '.'; }) &&
+            std::any_of(last.begin(), last.end(), [](unsigned char ch) { return std::isdigit(ch); });
+        if (LowerFilterText(last) == "common" || versionFolder) components.pop_back();
+        else break;
+    }
+    if (components.empty()) return "_root";
+    std::string root = components.front();
+    for (size_t i = 1; i < components.size(); ++i) root += "/" + components[i];
+    return root;
+}
+
+ArchiveInspection InspectModArchive(const pzmm::fs::path& archivePath) {
+    ArchiveInspection inspection;
+    wxFileInputStream input(PathToWx(archivePath));
+    if (!input.IsOk()) {
+        inspection.error = "Could not open the selected ZIP archive.";
+        return inspection;
+    }
+    wxZipInputStream zip(input);
+    std::string markerText;
+    std::set<std::string> candidateRoots;
+    std::unique_ptr<wxZipEntry> entry;
+    while ((entry.reset(zip.GetNextEntry()), entry)) {
+        std::string name = ToUtf8(entry->GetName(wxPATH_UNIX));
+        if (!NormalizeZipEntryName(name)) continue;
+        if (name == kModArchiveMarkerPath) {
+            char marker[128]{};
+            zip.Read(marker, sizeof(marker));
+            markerText.assign(marker, zip.LastRead());
+            continue;
+        }
+
+        const size_t slash = name.find('/');
+        const std::string root = slash == std::string::npos ? "_root" : name.substr(0, slash);
+        candidateRoots.insert(root);
+    }
+    inspection.marked = markerText == kModArchiveMarkerText;
+    if (!inspection.marked) {
+        std::set<std::string> metadataRoots;
+        wxFileInputStream secondInput(PathToWx(archivePath));
+        wxZipInputStream secondZip(secondInput);
+        while ((entry.reset(secondZip.GetNextEntry()), entry)) {
+            std::string name = ToUtf8(entry->GetName(wxPATH_UNIX));
+            if (!NormalizeZipEntryName(name) || entry->IsDir()) continue;
+            if (name != kModArchiveMarkerPath && LooksLikeModInfoPath(name))
+                metadataRoots.insert(ModRootForInfoEntry(name));
+        }
+        candidateRoots = metadataRoots.empty() ? std::move(candidateRoots) : std::move(metadataRoots);
+    }
+    std::set<std::string> stagedNames;
+    for (const auto& root : candidateRoots) {
+        const size_t slash = root.find_last_of('/');
+        const std::string base = root == "_root" ? "Imported mod" : root.substr(slash == std::string::npos ? 0 : slash + 1);
+        std::string staged = base;
+        for (size_t suffix = 2; !stagedNames.insert(LowerFilterText(staged)).second; ++suffix)
+            staged = base + " (" + std::to_string(suffix) + ")";
+        inspection.modRoots.emplace(root, staged);
+    }
+    if (inspection.modRoots.empty()) inspection.error = "No mod folders could be identified in this archive.";
+    return inspection;
+}
+
+bool ExtractModArchive(const pzmm::fs::path& archivePath,
+                       const pzmm::fs::path& destinationRoot,
+                       const ArchiveInspection& inspection,
+                       const std::atomic<bool>& cancel,
+                       std::string& error) {
+    std::error_code ec;
+    pzmm::fs::create_directories(destinationRoot, ec);
+    if (ec) {
+        error = "Could not create temporary import folder: " + ec.message();
+        return false;
+    }
+    wxFileInputStream input(PathToWx(archivePath));
+    if (!input.IsOk()) {
+        error = "Could not reopen the selected ZIP archive.";
+        return false;
+    }
+    wxZipInputStream zip(input);
+    std::unique_ptr<wxZipEntry> entry;
+    char buffer[64 * 1024];
+    while ((entry.reset(zip.GetNextEntry()), entry)) {
+        if (cancel.load()) {
+            error = "Archive import was cancelled.";
+            return false;
+        }
+        std::string name = ToUtf8(entry->GetName(wxPATH_UNIX));
+        if (!NormalizeZipEntryName(name) || name == kModArchiveMarkerPath || entry->IsDir()) continue;
+        auto matchedRoot = inspection.modRoots.end();
+        for (auto root = inspection.modRoots.begin(); root != inspection.modRoots.end(); ++root) {
+            const bool matches = root->first == "_root"
+                ? (inspection.modRoots.size() == 1 || name.find('/') == std::string::npos)
+                : name.compare(0, root->first.size(), root->first) == 0 &&
+                  name.size() > root->first.size() && name[root->first.size()] == '/';
+            if (matches && (matchedRoot == inspection.modRoots.end() || root->first.size() > matchedRoot->first.size()))
+                matchedRoot = root;
+        }
+        if (matchedRoot == inspection.modRoots.end()) continue;
+        const std::string relative = matchedRoot->first == "_root"
+            ? name
+            : name.substr(matchedRoot->first.size() + 1);
+        const auto outputPath = destinationRoot / pzmm::fs::u8path(matchedRoot->second) /
+                                pzmm::fs::u8path(relative);
+        pzmm::fs::create_directories(outputPath.parent_path(), ec);
+        if (ec) {
+            error = "Could not create an extracted mod folder: " + ec.message();
+            return false;
+        }
+        std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            error = "Could not write extracted file: " + pzmm::PathToUtf8(outputPath);
+            return false;
+        }
+        while (!zip.Eof() && !cancel.load()) {
+            zip.Read(buffer, sizeof(buffer));
+            const size_t count = zip.LastRead();
+            if (count == 0) break;
+            output.write(buffer, static_cast<std::streamsize>(count));
+            if (!output) {
+                error = "Could not write extracted file: " + pzmm::PathToUtf8(outputPath);
+                return false;
+            }
+        }
+        if (cancel.load()) {
+            error = "Archive import was cancelled.";
+            return false;
+        }
+        if (!zip.IsOk()) {
+            error = "A ZIP entry could not be read: " + name;
+            return false;
+        }
+    }
+    return true;
+}
+
+wxString FolderModifiedLabel(const pzmm::ModEntry& mod) {
+    if (mod.folderModifiedTime == pzmm::fs::file_time_type::min()) return "Unknown";
+    const auto systemTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        mod.folderModifiedTime - pzmm::fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+    const wxDateTime date(std::chrono::system_clock::to_time_t(systemTime));
+    return date.Format("%Y-%m-%d %H:%M");
 }
 
 std::string ToUtf8(const wxString& value) {
@@ -36,6 +261,10 @@ pzmm::fs::path ToFsPath(const wxString& value) {
 #else
     return pzmm::fs::u8path(ToUtf8(value));
 #endif
+}
+
+pzmm::fs::path MetadataCacheDirectory() {
+    return ToFsPath(wxStandardPaths::Get().GetUserLocalDataDir()) / "metadata-cache";
 }
 
 wxString PathToWx(const pzmm::fs::path& path) {
@@ -69,6 +298,34 @@ std::string EntryLoadStatus(const pzmm::ModEntry& entry) {
     return pzmm::LoadStatus(entry);
 }
 
+std::string LowerFilterText(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::vector<std::string> NumericVersionParts(const std::string& value) {
+    std::vector<std::string> parts;
+    std::string part;
+    for (const unsigned char ch : value) {
+        if (std::isdigit(ch)) {
+            part.push_back(static_cast<char>(ch));
+        } else if (!part.empty()) {
+            parts.push_back(std::move(part));
+            part.clear();
+        }
+    }
+    if (!part.empty()) parts.push_back(std::move(part));
+    return parts;
+}
+
+bool VersionMatchesBucket(const std::string& version, const std::string& bucket) {
+    const std::string normalized = LowerFilterText(version);
+    if (normalized.compare(0, bucket.size(), bucket) != 0) return false;
+    return normalized.size() == bucket.size() || normalized[bucket.size()] == '.';
+}
+
 bool OpenInExplorer(const pzmm::fs::path& path, bool selectFile = false) {
 #if defined(_WIN32)
     wxString command = "explorer.exe ";
@@ -87,6 +344,18 @@ bool CreateModArchive(const std::vector<pzmm::ModEntry>& mods,
                       const pzmm::ProgressCallback& progress,
                       pzmm::fs::path& archivePath,
                       std::string& error) {
+    struct ArchiveFile {
+        pzmm::fs::path path;
+        std::string entryName;
+    };
+    struct PreparedFile {
+        ArchiveFile file;
+        std::vector<char> content;
+        uintmax_t reservedBytes = 0;
+        std::string error;
+        bool buffered = false;
+    };
+
     std::error_code ec;
     pzmm::fs::create_directories(outputFolder, ec);
     if (ec) {
@@ -105,6 +374,45 @@ bool CreateModArchive(const std::vector<pzmm::ModEntry>& mods,
         return false;
     }
 
+    std::vector<ArchiveFile> files;
+    std::set<std::string> archiveRoots;
+    for (const auto& mod : mods) {
+        if (cancel.load()) {
+            error = "Archive creation was cancelled.";
+            return false;
+        }
+        std::string root = mod.folderName.empty() ? "mod" : mod.folderName;
+        const std::string baseRoot = root;
+        for (size_t suffix = 2; !archiveRoots.insert(root).second; ++suffix)
+            root = baseRoot + " (" + std::to_string(suffix) + ")";
+
+        std::error_code walkError;
+        pzmm::fs::recursive_directory_iterator it(
+            mod.folderPath, pzmm::fs::directory_options::skip_permission_denied, walkError), end;
+        for (; !walkError && it != end && !cancel.load(); it.increment(walkError)) {
+            std::error_code statusError;
+            const auto status = it->symlink_status(statusError);
+            if (statusError || !pzmm::fs::is_regular_file(status)) continue;
+
+            const auto relative = it->path().lexically_relative(mod.folderPath);
+            std::string relativeName = pzmm::PathToUtf8(relative);
+            std::replace(relativeName.begin(), relativeName.end(), '\\', '/');
+            files.push_back({it->path(), root + "/" + relativeName});
+        }
+        if (cancel.load()) {
+            error = "Archive creation was cancelled.";
+            return false;
+        }
+        if (walkError) {
+            error = "Could not scan " + pzmm::PathToUtf8(mod.folderPath) + ": " + walkError.message();
+            return false;
+        }
+    }
+    if (files.empty()) {
+        error = "No files were found in the selected mod folder(s).";
+        return false;
+    }
+
     bool archiveCreated = false;
     {
         wxFileOutputStream output(PathToWx(archivePath));
@@ -112,50 +420,156 @@ bool CreateModArchive(const std::vector<pzmm::ModEntry>& mods,
             error = "Could not create " + pzmm::PathToUtf8(archivePath) + ".";
         } else {
             wxZipOutputStream zip(output);
-            std::set<std::string> archiveRoots;
-            size_t fileCount = 0;
-            for (const auto& mod : mods) {
-                if (!error.empty()) break;
-                std::string root = mod.folderName.empty() ? "mod" : mod.folderName;
-                const std::string baseRoot = root;
-                for (size_t suffix = 2; !archiveRoots.insert(root).second; ++suffix)
-                    root = baseRoot + " (" + std::to_string(suffix) + ")";
+            zip.SetLevel(1);
+            if (!zip.PutNextEntry(FromUtf8(kModArchiveMarkerPath))) {
+                error = "Could not mark the ZIP as a Project Zomboid mod archive.";
+            } else {
+                wxMemoryInputStream markerInput(kModArchiveMarkerText, std::strlen(kModArchiveMarkerText));
+                zip.Write(markerInput);
+                if (!zip.IsOk()) error = "Could not write the mod archive marker.";
+            }
+            constexpr uintmax_t maxBufferedBytes = 64ULL * 1024 * 1024;
+            const unsigned int detectedThreads = std::thread::hardware_concurrency();
+            const size_t hardwareThreads = detectedThreads == 0 ? 2 : detectedThreads;
+            const size_t readerLimit = hardwareThreads > 3 ? hardwareThreads - 3 : 1;
+            const size_t readerCount = std::min(files.size(), readerLimit);
+            std::mutex mutex;
+            std::condition_variable readyCondition;
+            std::condition_variable capacityCondition;
+            std::deque<PreparedFile> ready;
+            uintmax_t bufferedBytes = 0;
+            size_t nextFile = 0;
+            size_t activeReaders = readerCount;
+            std::atomic<bool> stopReaders{!error.empty()};
 
-                std::error_code walkError;
-                pzmm::fs::recursive_directory_iterator it(
-                    mod.folderPath, pzmm::fs::directory_options::skip_permission_denied, walkError), end;
-                for (; !walkError && it != end && !cancel.load(); it.increment(walkError)) {
-                    std::error_code statusError;
-                    const auto status = it->symlink_status(statusError);
-                    if (statusError || !pzmm::fs::is_regular_file(status)) continue;
+            const auto reader = [&]() {
+                while (!cancel.load() && !stopReaders.load()) {
+                    size_t index = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (nextFile >= files.size()) break;
+                        index = nextFile++;
+                    }
 
-                    const auto relative = it->path().lexically_relative(mod.folderPath);
-                    std::string relativeName = pzmm::PathToUtf8(relative);
-                    std::replace(relativeName.begin(), relativeName.end(), '\\', '/');
-                    const std::string entryName = root + "/" + relativeName;
-                    if (progress) progress("Archiving: " + entryName);
-                    if (!zip.PutNextEntry(FromUtf8(entryName))) {
-                        error = "Could not add " + entryName + " to the archive.";
-                        break;
+                    PreparedFile prepared;
+                    prepared.file = files[index];
+                    std::error_code sizeError;
+                    const uintmax_t size = pzmm::fs::file_size(prepared.file.path, sizeError);
+                    if (sizeError) {
+                        prepared.error = "Could not inspect " + pzmm::PathToUtf8(prepared.file.path) +
+                                         ": " + sizeError.message();
+                    } else if (size <= maxBufferedBytes &&
+                               size <= static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        capacityCondition.wait(lock, [&]() {
+                            return cancel.load() || stopReaders.load() || bufferedBytes == 0 ||
+                                   bufferedBytes + size <= maxBufferedBytes;
+                        });
+                        if (cancel.load() || stopReaders.load()) break;
+                        bufferedBytes += size;
+                        prepared.reservedBytes = size;
+                        prepared.buffered = true;
+                        lock.unlock();
+
+                        try {
+                            prepared.content.resize(static_cast<size_t>(size));
+                            std::ifstream input(prepared.file.path, std::ios::binary);
+                            if (!input || (size > 0 &&
+                                (!input.read(prepared.content.data(), static_cast<std::streamsize>(size)) ||
+                                 static_cast<uintmax_t>(input.gcount()) != size))) {
+                                prepared.error = "Could not read " + pzmm::PathToUtf8(prepared.file.path) + ".";
+                            }
+                        } catch (const std::exception& exception) {
+                            prepared.error = "Could not buffer " + pzmm::PathToUtf8(prepared.file.path) +
+                                             ": " + exception.what();
+                        }
                     }
-                    wxFileInputStream input(PathToWx(it->path()));
-                    if (!input.IsOk()) {
-                        error = "Could not read " + pzmm::PathToUtf8(it->path()) + ".";
-                        break;
+
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        ready.push_back(std::move(prepared));
                     }
-                    zip.Write(input);
-                    if (!zip.IsOk()) {
-                        error = "Writing the archive failed while adding " + entryName + ".";
-                        break;
-                    }
-                    ++fileCount;
+                    readyCondition.notify_one();
                 }
-                if (cancel.load()) error = "Archive creation was cancelled.";
-                if (walkError && error.empty())
-                    error = "Could not scan " + pzmm::PathToUtf8(mod.folderPath) + ": " + walkError.message();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    --activeReaders;
+                }
+                readyCondition.notify_one();
+                capacityCondition.notify_all();
+            };
+
+            std::vector<std::thread> readers;
+            readers.reserve(readerCount);
+            for (size_t i = 0; i < readerCount; ++i) readers.emplace_back(reader);
+
+            size_t archivedFiles = 0;
+            bool writerFailed = !error.empty();
+            while (true) {
+                PreparedFile prepared;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    readyCondition.wait(lock, [&]() { return !ready.empty() || activeReaders == 0; });
+                    if (ready.empty() && activeReaders == 0) break;
+                    prepared = std::move(ready.front());
+                    ready.pop_front();
+                }
+
+                if (!writerFailed && !cancel.load()) {
+                    if (!prepared.error.empty()) {
+                        error = prepared.error;
+                        writerFailed = true;
+                        stopReaders.store(true);
+                        capacityCondition.notify_all();
+                    } else {
+                        if (progress) progress("Archiving: " + prepared.file.entryName);
+                        if (!zip.PutNextEntry(FromUtf8(prepared.file.entryName))) {
+                            error = "Could not add " + prepared.file.entryName + " to the archive.";
+                            writerFailed = true;
+                            stopReaders.store(true);
+                            capacityCondition.notify_all();
+                        } else if (prepared.buffered) {
+                            wxMemoryInputStream input(prepared.content.data(), prepared.content.size());
+                            zip.Write(input);
+                            if (!zip.IsOk()) {
+                                error = "Writing the archive failed while adding " + prepared.file.entryName + ".";
+                                writerFailed = true;
+                            }
+                        } else {
+                            wxFileInputStream input(PathToWx(prepared.file.path));
+                            if (!input.IsOk()) {
+                                error = "Could not read " + pzmm::PathToUtf8(prepared.file.path) + ".";
+                                writerFailed = true;
+                            } else {
+                                zip.Write(input);
+                                if (!zip.IsOk()) {
+                                    error = "Writing the archive failed while adding " + prepared.file.entryName + ".";
+                                    writerFailed = true;
+                                }
+                            }
+                        }
+                        if (writerFailed) {
+                            stopReaders.store(true);
+                            capacityCondition.notify_all();
+                        } else {
+                            ++archivedFiles;
+                        }
+                    }
+                }
+                if (prepared.reservedBytes != 0) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        bufferedBytes -= prepared.reservedBytes;
+                    }
+                    capacityCondition.notify_all();
+                }
             }
 
-            if (error.empty() && fileCount == 0) error = "No files were found in the selected mod folder(s).";
+            stopReaders.store(true);
+            capacityCondition.notify_all();
+            for (auto& thread : readers) thread.join();
+            if (cancel.load()) error = "Archive creation was cancelled.";
+            if (error.empty() && archivedFiles == 0) error = "No files were found in the selected mod folder(s).";
             const bool zipClosed = zip.Close();
             if (error.empty() && (!zipClosed || !output.IsOk())) error = "Finalizing the ZIP archive failed.";
             archiveCreated = error.empty();
@@ -171,9 +585,16 @@ bool CreateModArchive(const std::vector<pzmm::ModEntry>& mods,
 
 } // namespace
 
+MainFrame::ImportPlan::~ImportPlan() {
+    if (!temporaryRoot.empty()) {
+        std::error_code ec;
+        pzmm::fs::remove_all(temporaryRoot, ec);
+    }
+}
+
 MainFrame::MainFrame()
     : wxFrame(nullptr, wxID_ANY, "Project Zomboid Mod Manager", wxDefaultPosition, wxSize(1280, 820)),
-      m_progressTimer(this) {
+      m_progressTimer(this), m_selectionTimer(this) {
     SetMinSize(wxSize(960, 620));
 
     auto* root = new wxPanel(this);
@@ -186,6 +607,8 @@ MainFrame::MainFrame()
     titleFont.SetWeight(wxFONTWEIGHT_BOLD);
     title->SetFont(titleFont);
     headerSizer->Add(title, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
+    m_importButton = new wxButton(root, wxID_ANY, "Import ZIP...");
+    headerSizer->Add(m_importButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
     m_refreshButton = new wxButton(root, wxID_ANY, "Refresh scan");
     headerSizer->Add(m_refreshButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
     rootSizer->Add(headerSizer, 0, wxEXPAND | wxALL, 8);
@@ -227,10 +650,12 @@ MainFrame::MainFrame()
 
     m_browseUserButton->Bind(wxEVT_BUTTON, &MainFrame::OnBrowseUserPath, this);
     m_browseWorkshopButton->Bind(wxEVT_BUTTON, &MainFrame::OnBrowseWorkshopPath, this);
+    m_importButton->Bind(wxEVT_BUTTON, &MainFrame::OnImportArchive, this);
     m_refreshButton->Bind(wxEVT_BUTTON, &MainFrame::OnRefresh, this);
     Bind(wxEVT_PZMM_JOB_DONE, &MainFrame::OnJobDone, this);
     Bind(wxEVT_PZMM_PROGRESS, &MainFrame::OnProgress, this);
     Bind(wxEVT_TIMER, &MainFrame::OnProgressPulse, this, m_progressTimer.GetId());
+    Bind(wxEVT_TIMER, &MainFrame::OnSelectionSettled, this, m_selectionTimer.GetId());
 
     StartScan();
 }
@@ -238,6 +663,7 @@ MainFrame::MainFrame()
 MainFrame::~MainFrame() {
     m_shuttingDown.store(true);
     m_progressTimer.Stop();
+    m_selectionTimer.Stop();
     m_cancel.store(true);
     if (m_worker.joinable()) m_worker.join();
 }
@@ -253,15 +679,18 @@ MainFrame::PageWidgets MainFrame::BuildListPage(PageKind kind) {
     widgets.list->InsertColumn(0, "Mod name", wxLIST_FORMAT_LEFT, 190);
     widgets.list->InsertColumn(1, "Mod ID", wxLIST_FORMAT_LEFT, 165);
     widgets.list->InsertColumn(2, "Game versions", wxLIST_FORMAT_LEFT, 110);
-    widgets.list->InsertColumn(3, "default.txt", wxLIST_FORMAT_LEFT, 120);
+    widgets.list->InsertColumn(3, "State", wxLIST_FORMAT_LEFT, 120);
     if (kind == PageKind::WorkshopMods) {
         widgets.list->InsertColumn(4, "Locally installed", wxLIST_FORMAT_LEFT, 120);
         widgets.list->InsertColumn(5, "Workshop ID", wxLIST_FORMAT_LEFT, 100);
-        widgets.columnTitles = {"Mod name", "Mod ID", "Game versions", "default.txt",
-                                "Locally installed", "Workshop ID"};
+        widgets.list->InsertColumn(6, "Folder modified", wxLIST_FORMAT_LEFT, 135);
+        widgets.columnTitles = {"Mod name", "Mod ID", "Game versions", "State",
+                                "Locally installed", "Workshop ID", "Folder modified"};
     } else {
-        widgets.list->InsertColumn(4, "Workshop ID", wxLIST_FORMAT_LEFT, 100);
-        widgets.columnTitles = {"Mod name", "Mod ID", "Game versions", "default.txt", "Workshop ID"};
+        widgets.list->InsertColumn(4, "Folder modified", wxLIST_FORMAT_LEFT, 135);
+        widgets.list->InsertColumn(5, "Workshop update", wxLIST_FORMAT_LEFT, 150);
+        widgets.columnTitles = {"Mod name", "Mod ID", "Game versions", "State", "Folder modified",
+                                "Workshop update"};
     }
     contentSizer->Add(widgets.list, 3, wxEXPAND | wxALL, 5);
 
@@ -294,6 +723,19 @@ MainFrame::PageWidgets MainFrame::BuildListPage(PageKind kind) {
         outerSizer->Add(actionSizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
         m_copyButton->Bind(wxEVT_BUTTON, &MainFrame::OnCopySelected, this);
         m_updateButton->Bind(wxEVT_BUTTON, &MainFrame::OnUpdateSelected, this);
+    } else {
+        auto* actionSizer = new wxBoxSizer(wxHORIZONTAL);
+        actionSizer->Add(new wxStaticText(widgets.panel, wxID_ANY, "Update comparison:"), 0,
+                         wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 5);
+        m_userUpdateMethodChoice = new wxChoice(widgets.panel, wxID_ANY);
+        m_userUpdateMethodChoice->Append("mod.info version / game folders");
+        m_userUpdateMethodChoice->Append("Newest file modification time");
+        m_userUpdateMethodChoice->SetSelection(0);
+        actionSizer->Add(m_userUpdateMethodChoice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        m_updateUserButton = new wxButton(widgets.panel, wxID_ANY, "Update selected if newer");
+        actionSizer->Add(m_updateUserButton, 0, wxRIGHT, 5);
+        outerSizer->Add(actionSizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+        m_updateUserButton->Bind(wxEVT_BUTTON, &MainFrame::OnUpdateUserSelected, this);
     }
 
     widgets.panel->SetSizer(outerSizer);
@@ -309,7 +751,7 @@ MainFrame::PageWidgets MainFrame::BuildListPage(PageKind kind) {
     widgets.list->Bind(wxEVT_LIST_ITEM_SELECTED, [this, kind](wxListEvent& event) {
         OnListSelection(kind, event);
     });
-    widgets.list->Bind(wxEVT_LIST_ITEM_DESELECTED, [this, kind](wxListEvent& event) {
+    widgets.list->Bind(wxEVT_LIST_ITEM_DESELECTED, [this, kind](wxListEvent&) {
         PageWidgets& page = kind == PageKind::UserMods ? m_userPage : m_workshopPage;
         if (page.list->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED) < 0) {
             page.details->ChangeValue("Select a mod to inspect its metadata.");
@@ -325,7 +767,8 @@ void MainFrame::StartScan() {
     const auto workshopRoot = ToFsPath(m_workshopPathCtrl->GetValue());
     StartWorker([this, userRoot, workshopRoot](const std::atomic<bool>& cancel) {
         JobResult result;
-        result.scan = pzmm::ScanAll(userRoot, workshopRoot, cancel, [this](const std::string& text) { ReportProgress(text); });
+        result.scan = pzmm::ScanAll(userRoot, workshopRoot, cancel,
+            [this](const std::string& text) { ReportProgress(text); }, MetadataCacheDirectory());
         result.hasScan = true;
         result.success = true;
         result.message = "Scan complete.";
@@ -429,10 +872,52 @@ void MainFrame::OnColumnRightClick(PageKind kind, wxListEvent& event) {
     const int col = event.GetColumn();
     if (col < 0 || static_cast<size_t>(col) >= page->columnTitles.size()) return;
     wxMenu menu;
-    menu.Append(7101, "Filter by substring...");
-    menu.Append(7102, "Clear this column filter");
-    menu.Append(7103, "Clear all filters");
-    menu.Bind(wxEVT_MENU, [this, page, kind, col](wxCommandEvent& command) {
+    bool hasItems = false;
+    const bool presetColumn = IsPresetFilterColumn(kind, col);
+    std::map<int, std::string> presetItemKeys;
+    if (presetColumn) {
+        const auto options = page->presetOptions.find(col);
+        const auto current = page->valueFilters.find(col);
+        int optionId = 8000;
+        if (options == page->presetOptions.end() || options->second.empty()) {
+            menu.Append(wxID_ANY, "No values available")->Enable(false);
+            hasItems = true;
+        }
+        if (options != page->presetOptions.end()) for (const auto& option : options->second) {
+            auto* item = menu.AppendCheckItem(optionId, option.second);
+            if (current != page->valueFilters.end() && current->second.count(option.first)) item->Check(true);
+            presetItemKeys.emplace(optionId, option.first);
+            ++optionId;
+            hasItems = true;
+        }
+    } else {
+        menu.Append(7101, "Filter by substring...");
+        hasItems = true;
+    }
+
+    const bool hasColumnFilter = page->filters.count(col) || page->valueFilters.count(col);
+    const bool hasAnyFilter = !page->filters.empty() || !page->valueFilters.empty();
+    if (hasColumnFilter) {
+        if (hasItems) menu.AppendSeparator();
+        menu.Append(7102, "Clear this column filter");
+        hasItems = true;
+    }
+    if (hasAnyFilter) {
+        if (hasItems) menu.AppendSeparator();
+        menu.Append(7103, "Clear all filters");
+    }
+    menu.Bind(wxEVT_MENU, [this, page, kind, col, presetItemKeys](wxCommandEvent& command) {
+        const int id = command.GetId();
+        const auto option = presetItemKeys.find(id);
+        if (option != presetItemKeys.end()) {
+            auto& selected = page->valueFilters[col];
+            if (command.IsChecked()) selected.insert(option->second);
+            else selected.erase(option->second);
+            if (selected.empty()) page->valueFilters.erase(col);
+            const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
+            RefreshListView(kind, *page, mods);
+            return;
+        }
         if (command.GetId() == 7101) {
             wxTextEntryDialog dialog(this, "Show rows where this column contains:",
                                      "Filter: " + page->columnTitles[col], page->filters[col]);
@@ -445,10 +930,12 @@ void MainFrame::OnColumnRightClick(PageKind kind, wxListEvent& event) {
             }
         } else if (command.GetId() == 7102) {
             page->filters.erase(col);
+            page->valueFilters.erase(col);
             const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
             RefreshListView(kind, *page, mods);
         } else if (command.GetId() == 7103) {
             page->filters.clear();
+            page->valueFilters.clear();
             const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
             RefreshListView(kind, *page, mods);
         }
@@ -499,13 +986,100 @@ wxString MainFrame::ColumnValue(PageKind kind, const pzmm::ModEntry& mod, int co
         return FromUtf8(EntryLoadStatus(mod));
     case 4:
         if (kind == PageKind::WorkshopMods) {
-            const auto target = pzmm::ResolveTarget(mod, m_scanResults.userMods, m_scanResults.userModsPath);
-            return target.ambiguousId ? "Ambiguous ID" : (target.installed ? "Installed" : "Missing");
+            return mod.localMatchAmbiguous ? "Ambiguous ID" : (mod.locallyInstalled ? "Installed" : "Missing");
         }
-        return FromUtf8(mod.workshopItemId);
-    case 5: return FromUtf8(mod.workshopItemId);
+        return FolderModifiedLabel(mod);
+    case 5:
+        return kind == PageKind::WorkshopMods ? FromUtf8(mod.workshopItemId)
+            : FromUtf8(mod.workshopCounterpartFound
+                ? (mod.workshopUpdateAvailable ? "Update available" : "No newer Workshop version")
+                : "No Workshop match");
+    case 6:
+        return kind == PageKind::WorkshopMods ? FolderModifiedLabel(mod) : wxString{};
     default: return {};
     }
+}
+
+bool MainFrame::IsPresetFilterColumn(PageKind kind, int column) const {
+    return column == 2 || column == 3 ||
+           (kind == PageKind::WorkshopMods ? column == 4 : column == 5);
+}
+
+std::vector<std::pair<std::string, wxString>> MainFrame::PresetFilterOptions(PageKind kind, int column) const {
+    const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
+    std::map<std::string, wxString> options;
+    if (column == 2) {
+        for (const auto& mod : mods) {
+            if (mod.gameVersions.empty()) {
+                options.emplace("version:none", "No game-version folders");
+                continue;
+            }
+            for (const auto& version : mod.gameVersions) {
+                const std::string normalized = LowerFilterText(version);
+                options.emplace("version:exact:" + normalized, FromUtf8(version + " (exact)"));
+                const auto parts = NumericVersionParts(version);
+                if (!parts.empty()) {
+                    options.emplace("version:major:" + parts[0], FromUtf8(parts[0] + " (all subversions)"));
+                    if (parts.size() > 1) {
+                        const std::string minor = parts[0] + "." + parts[1];
+                        options.emplace("version:minor:" + minor, FromUtf8(minor + " (all subversions)"));
+                    }
+                }
+            }
+        }
+    } else if (column == 3) {
+        for (const auto& mod : mods) {
+            if (mod.id.empty()) options.emplace("state:no-id", "No mod.info ID");
+            else if (mod.loadOrder > 0) options.emplace("state:enabled", "Enabled");
+            else options.emplace("state:not-enabled", "Not enabled");
+        }
+    } else if (kind == PageKind::WorkshopMods && column == 4) {
+        for (const auto& mod : mods) {
+            if (mod.localMatchAmbiguous) options.emplace("installed:ambiguous", "Ambiguous ID");
+            else if (mod.locallyInstalled) options.emplace("installed:yes", "Installed");
+            else options.emplace("installed:no", "Missing");
+        }
+    } else if (kind == PageKind::UserMods && column == 5) {
+        for (const auto& mod : mods) {
+            if (!mod.workshopCounterpartFound) options.emplace("update:no-match", "No Workshop match");
+            else if (mod.workshopUpdateAvailable) options.emplace("update:available", "Update available");
+            else options.emplace("update:current", "No newer Workshop version");
+        }
+    }
+
+    return {options.begin(), options.end()};
+}
+
+bool MainFrame::MatchesPresetFilter(PageKind kind, const pzmm::ModEntry& mod, int column,
+                                    const std::set<std::string>& selected) const {
+    if (column == 2) {
+        for (const auto& version : mod.gameVersions) {
+            const std::string normalized = LowerFilterText(version);
+            if (selected.count("version:exact:" + normalized)) return true;
+            for (const auto& key : selected) {
+                constexpr const char* majorPrefix = "version:major:";
+                constexpr const char* minorPrefix = "version:minor:";
+                if (key.compare(0, std::char_traits<char>::length(majorPrefix), majorPrefix) == 0 &&
+                    VersionMatchesBucket(version, key.substr(std::char_traits<char>::length(majorPrefix))))
+                    return true;
+                if (key.compare(0, std::char_traits<char>::length(minorPrefix), minorPrefix) == 0 &&
+                    VersionMatchesBucket(version, key.substr(std::char_traits<char>::length(minorPrefix))))
+                    return true;
+            }
+        }
+        return mod.gameVersions.empty() && selected.count("version:none");
+    }
+
+    std::string key;
+    if (column == 3) {
+        key = mod.id.empty() ? "state:no-id" : (mod.loadOrder > 0 ? "state:enabled" : "state:not-enabled");
+    } else if (kind == PageKind::WorkshopMods && column == 4) {
+        key = mod.localMatchAmbiguous ? "installed:ambiguous" : (mod.locallyInstalled ? "installed:yes" : "installed:no");
+    } else if (kind == PageKind::UserMods && column == 5) {
+        key = !mod.workshopCounterpartFound ? "update:no-match"
+            : (mod.workshopUpdateAvailable ? "update:available" : "update:current");
+    }
+    return !key.empty() && selected.count(key) != 0;
 }
 
 void MainFrame::OnJobDone(wxThreadEvent& event) {
@@ -518,6 +1092,15 @@ void MainFrame::OnJobDone(wxThreadEvent& event) {
     }
 
     JobResult result = *payload;
+    if (result.importPlan) {
+        m_progressTimer.Stop();
+        m_progressGauge->SetValue(0);
+        m_activityText->SetLabel("Ready.");
+        m_statusBar->SetStatusText("Idle", 1);
+        SetBusy(false);
+        ReviewImportPlan(result.importPlan);
+        return;
+    }
     if (result.hasScan) {
         m_scanResults = std::move(result.scan);
         m_hasScan = true;
@@ -560,6 +1143,241 @@ void MainFrame::OnBrowseWorkshopPath(wxCommandEvent&) {
     if (dialog.ShowModal() == wxID_OK) m_workshopPathCtrl->SetValue(dialog.GetPath());
 }
 
+void MainFrame::OnImportArchive(wxCommandEvent&) {
+    if (m_busy) return;
+    if (!m_hasScan || !PathsMatchLastScan()) {
+        wxMessageBox("Refresh the scan after changing either folder path before importing mods.",
+                     "Refresh required", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    pzmm::fs::path archivePath;
+    ArchiveInspection inspection;
+    for (;;) {
+        wxFileDialog dialog(this, "Select a mods ZIP archive", wxEmptyString, wxEmptyString,
+                            "ZIP archives (*.zip)|*.zip", wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        if (dialog.ShowModal() != wxID_OK) return;
+        archivePath = ToFsPath(dialog.GetPath());
+        inspection = InspectModArchive(archivePath);
+        if (!inspection.error.empty()) {
+            wxMessageBox(FromUtf8(inspection.error), "Archive inspection failed", wxOK | wxICON_WARNING, this);
+            return;
+        }
+        if (inspection.marked) break;
+        const int answer = wxMessageBox(
+            "This ZIP does not contain the Project Zomboid Mod Manager archive marker. "
+            "Continue only if you are sure it contains mod folders.\n\n"
+            "Choose Yes to inspect it, No to select a different ZIP, or Cancel to stop.",
+            "Unrecognized ZIP archive", wxYES_NO | wxCANCEL | wxICON_WARNING, this);
+        if (answer == wxYES) break;
+        if (answer != wxNO) return;
+    }
+
+    std::error_code tempError;
+    const auto tempRoot = pzmm::fs::temp_directory_path(tempError) /
+        pzmm::fs::u8path("PZModManagerImport-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    if (tempError) {
+        wxMessageBox("Could not locate a temporary folder for archive inspection.",
+                     "Import failed", wxOK | wxICON_WARNING, this);
+        return;
+    }
+    const auto userRoot = ToFsPath(m_userPathCtrl->GetValue());
+    const auto workshopRoot = ToFsPath(m_workshopPathCtrl->GetValue());
+    StartWorker([this, archivePath, inspection = std::move(inspection), tempRoot, userRoot, workshopRoot]
+                (const std::atomic<bool>& cancel) mutable {
+        JobResult result;
+        auto plan = std::make_shared<ImportPlan>();
+        plan->temporaryRoot = tempRoot;
+        plan->userModsRoot = userRoot;
+        plan->workshopRoot = workshopRoot;
+        std::string error;
+        if (!ExtractModArchive(archivePath, tempRoot, inspection, cancel, error)) {
+            result.success = false;
+            result.showMessage = true;
+            result.message = "Could not inspect the selected mod archive. " + error;
+            return result;
+        }
+        const auto imported = pzmm::ScanAll(tempRoot, {}, cancel,
+            [this](const std::string& text) { ReportProgress(text); }, MetadataCacheDirectory());
+        plan->mods = imported.userMods;
+        if (plan->mods.empty()) {
+            result.success = false;
+            result.showMessage = true;
+            result.message = "The archive did not contain any recognizable mod folders.";
+            return result;
+        }
+        result.message = "Archive inspection complete.";
+        result.importPlan = std::move(plan);
+        return result;
+    });
+}
+
+void MainFrame::ReviewImportPlan(const std::shared_ptr<ImportPlan>& plan) {
+    if (!plan || plan->mods.empty()) return;
+
+    struct Candidate {
+        size_t importedIndex = 0;
+        std::optional<pzmm::ModEntry> installed;
+        std::optional<int> versionComparison;
+    };
+    std::vector<Candidate> candidates;
+    std::vector<size_t> newMods;
+    std::vector<size_t> outdatedMods;
+    std::vector<size_t> sameVersionMods;
+    std::vector<size_t> olderImports;
+    std::vector<size_t> unknownVersions;
+
+    for (size_t i = 0; i < plan->mods.size(); ++i) {
+        const auto& imported = plan->mods[i];
+        const auto target = pzmm::ResolveTarget(imported, m_scanResults.userMods, plan->userModsRoot);
+        Candidate candidate;
+        candidate.importedIndex = i;
+        if (target.matchedEntry) {
+            candidate.installed = *target.matchedEntry;
+            candidate.versionComparison = CompareImportModVersions(imported.modVersion, target.matchedEntry->modVersion);
+        }
+        candidates.push_back(candidate);
+        if (!candidate.installed) newMods.push_back(i);
+        else if (!candidate.versionComparison) unknownVersions.push_back(i);
+        else if (*candidate.versionComparison > 0) outdatedMods.push_back(i);
+        else if (*candidate.versionComparison == 0) sameVersionMods.push_back(i);
+        else olderImports.push_back(i);
+    }
+
+    const wxString summary = "Archive contents: " + FromUtf8(std::to_string(plan->mods.size())) +
+        " mod(s). New: " + FromUtf8(std::to_string(newMods.size())) +
+        ", newer modversion: " + FromUtf8(std::to_string(outdatedMods.size())) +
+        ", same modversion: " + FromUtf8(std::to_string(sameVersionMods.size())) +
+        ", older: " + FromUtf8(std::to_string(olderImports.size())) +
+        ", version unknown: " + FromUtf8(std::to_string(unknownVersions.size())) + ".";
+    wxMessageBox(summary, "Import comparison", wxOK | wxICON_INFORMATION, this);
+
+    bool combineWithExisting = true;
+    if (!m_scanResults.userMods.empty()) {
+        const int answer = wxMessageBox(
+            "The User Mods folder already contains " + FromUtf8(std::to_string(m_scanResults.userMods.size())) +
+            " mod(s). Combine this import with the existing mods? Choosing No imports into separate folders without replacing existing mods.",
+            "Combine imported mods?", wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
+        if (answer == wxCANCEL) return;
+        combineWithExisting = answer == wxYES;
+    }
+
+    bool updateOutdated = false;
+    if (combineWithExisting && !outdatedMods.empty()) {
+        updateOutdated = wxMessageBox(
+            "The archive has a higher modversion for " + FromUtf8(std::to_string(outdatedMods.size())) +
+            " existing mod(s). Replace those local folders with the imported versions?",
+            "Update outdated mods?", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) == wxYES;
+    }
+    bool replaceSameVersion = false;
+    if (combineWithExisting && !sameVersionMods.empty()) {
+        replaceSameVersion = wxMessageBox(
+            "The archive contains " + FromUtf8(std::to_string(sameVersionMods.size())) +
+            " mod(s) with the same modversion as the installed copy. Replace those folders anyway?",
+            "Replace same-version mods?", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) == wxYES;
+    }
+    bool importUnknownSeparately = false;
+    if (combineWithExisting && !unknownVersions.empty()) {
+        importUnknownSeparately = wxMessageBox(
+            "Could not compare modversion for " + FromUtf8(std::to_string(unknownVersions.size())) +
+            " matching mod(s). Import them into separate folders rather than replacing the installed copies?",
+            "Unknown modversion", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) == wxYES;
+    }
+
+    struct Action {
+        pzmm::ModEntry source;
+        pzmm::fs::path destination;
+        bool replace = false;
+    };
+    std::vector<Action> actions;
+    std::set<std::string> reservedPaths;
+    const auto pathKey = [](const pzmm::fs::path& path) {
+        return LowerFilterText(pzmm::PathToUtf8(path.lexically_normal()));
+    };
+    const auto uniqueDestination = [&](const pzmm::ModEntry& mod) {
+        std::string base = mod.folderName.empty() ? "Imported mod" : mod.folderName;
+        auto candidate = plan->userModsRoot / pzmm::fs::u8path(base);
+        for (size_t suffix = 2;; ++suffix) {
+            std::error_code existsError;
+            if (!pzmm::fs::exists(candidate, existsError) && !existsError && !reservedPaths.count(pathKey(candidate))) {
+                reservedPaths.insert(pathKey(candidate));
+                return candidate;
+            }
+            candidate = plan->userModsRoot / pzmm::fs::u8path(base + " (imported " + std::to_string(suffix) + ")");
+        }
+    };
+    const auto addNew = [&](size_t index) {
+        const auto& source = plan->mods[index];
+        actions.push_back({source, uniqueDestination(source), false});
+    };
+    for (const size_t index : newMods) addNew(index);
+
+    if (combineWithExisting) {
+        const auto addReplacement = [&](size_t index) {
+            const auto& candidate = candidates[index];
+            if (!candidate.installed) return;
+            const auto destination = candidate.installed->folderPath;
+            if (!reservedPaths.insert(pathKey(destination)).second) return;
+            actions.push_back({plan->mods[index], destination, true});
+        };
+        if (updateOutdated) for (const size_t index : outdatedMods) addReplacement(index);
+        if (replaceSameVersion) for (const size_t index : sameVersionMods) addReplacement(index);
+        if (importUnknownSeparately) for (const size_t index : unknownVersions) addNew(index);
+    } else {
+        for (size_t i = 0; i < plan->mods.size(); ++i) {
+            if (std::find(newMods.begin(), newMods.end(), i) == newMods.end()) addNew(i);
+        }
+    }
+
+    if (actions.empty()) {
+        wxMessageBox("No import operations were selected. Older or uncomparable versions were left unchanged.",
+                     "Nothing to import", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    const int finalAnswer = wxMessageBox(
+        "Proceed with " + FromUtf8(std::to_string(actions.size())) +
+        " import operation(s)? Replaced folders are fully replaced and local-only files inside them will be removed.",
+        "Confirm mod import", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+    if (finalAnswer != wxYES) return;
+
+    const auto userRoot = plan->userModsRoot;
+    const auto workshopRoot = plan->workshopRoot;
+    StartWorker([this, plan, actions = std::move(actions), userRoot, workshopRoot]
+                (const std::atomic<bool>& cancel) mutable {
+        JobResult result;
+        size_t importedCount = 0;
+        size_t replacedCount = 0;
+        size_t failedCount = 0;
+        std::ostringstream failures;
+        for (const auto& action : actions) {
+            if (cancel.load()) break;
+            std::string error;
+            const auto progress = [this](const std::string& text) { ReportProgress(text); };
+            const bool ok = action.replace
+                ? pzmm::ReplaceDirectoryContents(action.source.folderPath, action.destination, error, &cancel, progress)
+                : pzmm::CopyDirectoryContents(action.source.folderPath, action.destination, error, &cancel, progress);
+            if (ok) {
+                if (action.replace) ++replacedCount;
+                else ++importedCount;
+                if (!error.empty()) failures << "\n" << action.source.name << ": " << error;
+            } else {
+                ++failedCount;
+                failures << "\n" << action.source.name << ": " << error;
+            }
+        }
+        result.success = failedCount == 0;
+        result.showMessage = true;
+        result.message = "Import complete: " + std::to_string(importedCount) + " added, " +
+            std::to_string(replacedCount) + " replaced, " + std::to_string(failedCount) +
+            " failed." + failures.str();
+        result.scan = pzmm::ScanAll(userRoot, workshopRoot, cancel,
+            [this](const std::string& text) { ReportProgress(text); }, MetadataCacheDirectory());
+        result.hasScan = true;
+        return result;
+    });
+}
+
 void MainFrame::OnCopySelected(wxCommandEvent&) {
     StartCopyOrUpdate(false);
 }
@@ -568,12 +1386,36 @@ void MainFrame::OnUpdateSelected(wxCommandEvent&) {
     StartCopyOrUpdate(true);
 }
 
+void MainFrame::OnUpdateUserSelected(wxCommandEvent&) {
+    StartUpdateFromUserSelection();
+}
+
 void MainFrame::OnRefresh(wxCommandEvent&) {
     StartScan();
 }
 
 void MainFrame::OnListSelection(PageKind kind, wxListEvent& event) {
-    UpdateDetails(kind, event.GetIndex());
+    m_pendingSelectionKind = kind;
+    m_pendingSelectionRow = event.GetIndex();
+    m_selectionTimer.StartOnce(100);
+}
+
+void MainFrame::OnSelectionSettled(wxTimerEvent&) {
+    PageWidgets& page = m_pendingSelectionKind == PageKind::UserMods ? m_userPage : m_workshopPage;
+    long row = m_pendingSelectionRow;
+    if (row < 0 || !(page.list->GetItemState(row, wxLIST_STATE_SELECTED) & wxLIST_STATE_SELECTED)) {
+        row = -1;
+        for (long selected = page.list->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+             selected >= 0; selected = page.list->GetNextItem(selected, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED)) {
+            row = selected;
+        }
+    }
+    if (row >= 0) {
+        UpdateDetails(m_pendingSelectionKind, row);
+    } else {
+        page.details->ChangeValue("Select a mod to inspect its metadata.");
+        SetPoster(page, {});
+    }
 }
 
 void MainFrame::PopulateAllLists() {
@@ -584,6 +1426,23 @@ void MainFrame::PopulateAllLists() {
 void MainFrame::PopulateList(PageKind kind, PageWidgets& page, const std::vector<pzmm::ModEntry>& mods) {
     page.visibleIndices.clear();
     page.list->DeleteAllItems();
+    page.presetOptions.clear();
+    for (size_t column = 0; column < page.columnTitles.size(); ++column) {
+        const int index = static_cast<int>(column);
+        if (!IsPresetFilterColumn(kind, index)) continue;
+        auto options = PresetFilterOptions(kind, index);
+        std::set<std::string> existingKeys;
+        for (const auto& option : options) existingKeys.insert(option.first);
+        page.presetOptions.emplace(index, std::move(options));
+        auto filter = page.valueFilters.find(index);
+        if (filter != page.valueFilters.end()) {
+            for (auto it = filter->second.begin(); it != filter->second.end();) {
+                if (!existingKeys.count(*it)) it = filter->second.erase(it);
+                else ++it;
+            }
+            if (filter->second.empty()) page.valueFilters.erase(filter);
+        }
+    }
     RefreshListView(kind, page, mods);
 
     if (kind == PageKind::UserMods) {
@@ -608,6 +1467,14 @@ void MainFrame::RefreshListView(PageKind kind, PageWidgets& page, const std::vec
             if (!ColumnValue(kind, mods[i], filter.first).Lower().Contains(filter.second.Lower())) {
                 match = false;
                 break;
+            }
+        }
+        if (match) {
+            for (const auto& filter : page.valueFilters) {
+                if (!MatchesPresetFilter(kind, mods[i], filter.first, filter.second)) {
+                    match = false;
+                    break;
+                }
             }
         }
         if (match) indices.push_back(i);
@@ -636,7 +1503,6 @@ void MainFrame::RefreshListView(PageKind kind, PageWidgets& page, const std::vec
         const auto& mod = mods[sourceIndex];
         const long row = page.list->InsertItem(static_cast<long>(rowIndex), FromUtf8(mod.name));
         for (size_t col = 1; col < page.columnTitles.size(); ++col)
-    for (size_t col = 1; col < page.columnTitles.size(); ++col)
             page.list->SetItem(row, static_cast<int>(col), ColumnValue(kind, mod, static_cast<int>(col)));
         page.list->SetItemData(row, static_cast<wxUIntPtr>(sourceIndex));
     }
@@ -691,6 +1557,7 @@ wxString MainFrame::DescribeMod(const pzmm::ModEntry& entry, PageKind kind) cons
     out << "Shared common folder: " << (entry.hasCommonFolder ? "yes" : "no") << "\n";
     out << "Available game versions: " << (entry.gameVersions.empty() ? "(none with mod.info)" : pzmm::Join(entry.gameVersions, ", ")) << "\n";
     out << "Folder path: " << pzmm::PathToUtf8(entry.folderPath) << "\n\n";
+    out << "Folder timestamp: " << ToUtf8(FolderModifiedLabel(entry)) << " (top-level directory only)\n";
     out << "Description:\n" << (entry.description.empty() ? "(not specified)" : entry.description) << "\n";
 
     if (kind == PageKind::WorkshopMods) {
@@ -751,6 +1618,7 @@ void MainFrame::SetPoster(PageWidgets& page, const pzmm::fs::path& path) {
 void MainFrame::SetBusy(bool busy) {
     m_busy = busy;
     m_refreshButton->Enable(!busy);
+    m_importButton->Enable(!busy);
     m_userPathCtrl->Enable(!busy);
     m_workshopPathCtrl->Enable(!busy);
     m_browseUserButton->Enable(!busy);
@@ -758,6 +1626,7 @@ void MainFrame::SetBusy(bool busy) {
     m_notebook->Enable(true);
     if (m_copyButton) m_copyButton->Enable(!busy);
     if (m_updateButton) m_updateButton->Enable(!busy);
+    if (m_updateUserButton) m_updateUserButton->Enable(!busy);
 }
 
 std::vector<size_t> MainFrame::SelectedIndices(const PageWidgets& page) const {
@@ -899,6 +1768,67 @@ void MainFrame::StartCopyOrUpdate(bool updateOnly) {
         ? pzmm::UpdateMethod::FileModificationTime
         : pzmm::UpdateMethod::ModInfoVersion;
 
+    if (updateOnly) {
+        const wxString prompt = "Update " + FromUtf8(std::to_string(jobs.size())) +
+            " selected mod(s) when newer Workshop files are found? Updated folders will be replaced completely; "
+            "local-only files in those folders will be removed.";
+        if (wxMessageBox(prompt, "Confirm full mod replacement", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES)
+            return;
+    }
+
+    RunCopyJobs(std::move(jobs), updateOnly, method, userRoot, workshopRoot);
+}
+
+void MainFrame::StartUpdateFromUserSelection() {
+    if (m_busy) return;
+    if (!m_hasScan || !PathsMatchLastScan()) {
+        wxMessageBox("Refresh the scan after changing either folder path before updating mods.",
+                     "Refresh required", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    const auto selected = SelectedIndices(m_userPage);
+    if (selected.empty()) {
+        wxMessageBox("Select one or more local mods first.", "No mods selected", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    const auto userRoot = ToFsPath(m_userPathCtrl->GetValue());
+    const auto workshopRoot = ToFsPath(m_workshopPathCtrl->GetValue());
+    std::vector<CopyJob> jobs;
+    for (const size_t index : selected) {
+        if (index >= m_scanResults.userMods.size()) continue;
+        const auto& local = m_scanResults.userMods[index];
+        for (const auto& source : m_scanResults.workshopMods) {
+            const bool folderMatch = pzmm::NormalizeId(source.folderName) == pzmm::NormalizeId(local.folderName);
+            const bool idMatch = !source.localMatchAmbiguous && !local.id.empty() &&
+                pzmm::NormalizeId(source.id) == pzmm::NormalizeId(local.id);
+            if (!folderMatch && !idMatch) continue;
+            CopyJob job;
+            job.source = source;
+            job.installed = local;
+            job.targetPath = local.folderPath;
+            jobs.push_back(std::move(job));
+            break;
+        }
+    }
+    if (jobs.empty()) {
+        wxMessageBox("No selected local mods have an unambiguous Workshop counterpart.",
+                     "No Workshop match", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    const wxString prompt = "Check " + FromUtf8(std::to_string(jobs.size())) +
+        " selected local mod(s) for a newer Workshop version? Updated folders will be replaced completely; "
+        "local-only files in those folders will be removed.";
+    if (wxMessageBox(prompt, "Confirm full mod replacement", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES)
+        return;
+    const auto method = m_userUpdateMethodChoice && m_userUpdateMethodChoice->GetSelection() == 1
+        ? pzmm::UpdateMethod::FileModificationTime
+        : pzmm::UpdateMethod::ModInfoVersion;
+    RunCopyJobs(std::move(jobs), true, method, userRoot, workshopRoot);
+}
+
+void MainFrame::RunCopyJobs(std::vector<CopyJob> jobs, bool updateOnly, pzmm::UpdateMethod method,
+                            const pzmm::fs::path& userRoot, const pzmm::fs::path& workshopRoot) {
     StartWorker([this, jobs = std::move(jobs), userRoot, workshopRoot, updateOnly, method]
                 (const std::atomic<bool>& cancel) mutable {
         JobResult result;
@@ -924,9 +1854,13 @@ void MainFrame::StartCopyOrUpdate(bool updateOnly) {
                 }
             }
             std::string copyError;
-            if (pzmm::CopyDirectoryContents(job.source.folderPath, job.targetPath, copyError, &cancel,
-                    [this](const std::string& text) { ReportProgress(text); })) {
+            const auto reportProgress = [this](const std::string& text) { ReportProgress(text); };
+            const bool copied = updateOnly
+                ? pzmm::ReplaceDirectoryContents(job.source.folderPath, job.targetPath, copyError, &cancel, reportProgress)
+                : pzmm::CopyDirectoryContents(job.source.folderPath, job.targetPath, copyError, &cancel, reportProgress);
+            if (copied) {
                 ++completed;
+                if (!copyError.empty()) summary << "\n" << job.source.name << ": " << copyError;
             } else {
                 ++failed;
                 summary << "\n" << job.source.name << ": " << copyError;
@@ -937,7 +1871,8 @@ void MainFrame::StartCopyOrUpdate(bool updateOnly) {
             std::to_string(completed) + " copied/updated, " + std::to_string(skipped) +
             " skipped, " + std::to_string(failed) + " failed." + summary.str();
         result.showMessage = true;
-        result.scan = pzmm::ScanAll(userRoot, workshopRoot, cancel, [this](const std::string& text) { ReportProgress(text); });
+        result.scan = pzmm::ScanAll(userRoot, workshopRoot, cancel,
+            [this](const std::string& text) { ReportProgress(text); }, MetadataCacheDirectory());
         result.hasScan = true;
         return result;
     });

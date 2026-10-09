@@ -35,11 +35,16 @@ struct ModEntry {
     std::string workshopItemId;
 
     fs::path folderPath;
+    fs::file_time_type folderModifiedTime = fs::file_time_type::min();
     fs::path posterPath;
     std::map<std::string, std::string> metadata;
     std::vector<ModVersionInfo> versions;
     std::vector<std::string> gameVersions;
     bool hasCommonFolder = false;
+    bool workshopCounterpartFound = false;
+    bool workshopUpdateAvailable = false;
+    bool locallyInstalled = false;
+    bool localMatchAmbiguous = false;
     int loadOrder = 0; // 1-based position in default.txt; 0 means absent.
 };
 
@@ -78,7 +83,8 @@ using ProgressCallback = std::function<void(const std::string&)>;
 ScanResults ScanAll(const fs::path& userModsPath,
                     const fs::path& workshopPath,
                     const std::atomic<bool>& cancel,
-                    ProgressCallback progress = {});
+                    ProgressCallback progress = {},
+                    const fs::path& metadataCacheDirectory = {});
 
 TargetResolution ResolveTarget(const ModEntry& workshopMod,
                                const std::vector<ModEntry>& userMods,
@@ -95,6 +101,12 @@ bool CopyDirectoryContents(const fs::path& source,
                            std::string& errorMessage,
                            const std::atomic<bool>* cancel = nullptr,
                            ProgressCallback progress = {});
+
+bool ReplaceDirectoryContents(const fs::path& source,
+                              const fs::path& destination,
+                              std::string& errorMessage,
+                              const std::atomic<bool>* cancel = nullptr,
+                              ProgressCallback progress = {});
 
 std::string LoadStatus(const ModEntry& entry);
 

@@ -2,11 +2,20 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <fstream>
+#include <iomanip>
+#include <limits>
+#include <exception>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <system_error>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <utility>
 
 namespace pzmm {
 namespace {
@@ -16,6 +25,59 @@ std::string Trim(const std::string& text) {
     if (first == std::string::npos) return {};
     const auto last = text.find_last_not_of(" \t\r\n");
     return text.substr(first, last - first + 1);
+}
+
+size_t ScanWorkerCount(size_t taskCount) {
+    const unsigned int available = std::thread::hardware_concurrency();
+    const size_t hardwareThreads = available == 0 ? 2 : available;
+    const size_t workerLimit = hardwareThreads > 2 ? hardwareThreads - 2 : 1;
+    return std::min(taskCount, workerLimit);
+}
+
+template<typename Function>
+void ParallelForEach(size_t taskCount, const std::atomic<bool>& cancel, Function function) {
+    const size_t workerCount = ScanWorkerCount(taskCount);
+    if (workerCount == 0) return;
+
+    std::atomic<size_t> nextTask{0};
+    std::atomic<bool> stop{false};
+    std::mutex failureMutex;
+    std::exception_ptr failure;
+    const auto worker = [&]() {
+        while (!cancel.load() && !stop.load()) {
+            const size_t index = nextTask.fetch_add(1);
+            if (index >= taskCount) return;
+            try {
+                function(index);
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(failureMutex);
+                    if (!failure) failure = std::current_exception();
+                }
+                stop.store(true);
+                return;
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount > 0 ? workerCount - 1 : 0);
+    for (size_t i = 1; i < workerCount; ++i) workers.emplace_back(worker);
+    worker();
+    for (auto& thread : workers) thread.join();
+    if (failure) std::rethrow_exception(failure);
+}
+
+std::string CacheFileName(const fs::path& path) {
+    const std::string key = PathToUtf8(path.lexically_normal());
+    uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char ch : key) {
+        hash ^= ch;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream name;
+    name << std::hex << hash << ".cache";
+    return name.str();
 }
 
 std::string Lower(std::string value) {
@@ -36,8 +98,33 @@ bool IsRegularFile(const fs::path& path) {
 }
 
 std::map<std::string, std::string> ReadModInfo(const fs::path& infoPath,
-                                                const std::atomic<bool>& cancel) {
+                                                const std::atomic<bool>& cancel,
+                                                const fs::path& cacheDirectory) {
     std::map<std::string, std::string> fields;
+    std::error_code statusError;
+    const auto fileSize = fs::file_size(infoPath, statusError);
+    if (statusError) return fields;
+    const auto modified = fs::last_write_time(infoPath, statusError);
+    if (statusError) return fields;
+    const std::string pathKey = PathToUtf8(infoPath.lexically_normal());
+    const auto cacheFile = cacheDirectory.empty() ? fs::path{} : cacheDirectory / CacheFileName(infoPath);
+
+    if (!cacheFile.empty()) {
+        std::ifstream cache(cacheFile, std::ios::binary);
+        std::string cachedPath;
+        uintmax_t cachedSize = 0;
+        long long cachedModified = 0;
+        if (cache >> std::quoted(cachedPath) >> cachedSize >> cachedModified &&
+            cachedPath == pathKey && cachedSize == fileSize &&
+            cachedModified == modified.time_since_epoch().count()) {
+            std::string key;
+            std::string value;
+            while (cache >> std::quoted(key) >> std::quoted(value)) fields[key] = value;
+            if (cache.eof()) return fields;
+            fields.clear();
+        }
+    }
+
     std::ifstream input(infoPath, std::ios::binary);
     if (!input) return fields;
 
@@ -57,20 +144,45 @@ std::map<std::string, std::string> ReadModInfo(const fs::path& infoPath,
         const std::string value = Trim(line.substr(equals + 1));
         if (!key.empty()) fields[key] = value;
     }
+
+    if (!cacheFile.empty() && !cancel.load()) {
+        std::error_code directoryError;
+        fs::create_directories(cacheDirectory, directoryError);
+        if (!directoryError) {
+            std::ofstream cache(cacheFile, std::ios::binary | std::ios::trunc);
+            if (cache) {
+                cache << std::quoted(pathKey) << ' ' << fileSize << ' '
+                      << modified.time_since_epoch().count() << '\n';
+                for (const auto& field : fields)
+                    cache << std::quoted(field.first) << ' ' << std::quoted(field.second) << '\n';
+            }
+        }
+    }
     return fields;
 }
 
 bool VersionLabelLess(const std::string& left, const std::string& right) {
-    // Compare numeric components, so "42.9" sorts before "42.10".
-    static const std::regex numberPattern(R"((\d+))");
-    std::vector<unsigned long long> a;
-    std::vector<unsigned long long> b;
-    for (std::sregex_iterator it(left.begin(), left.end(), numberPattern), end; it != end; ++it) {
-        try { a.push_back(std::stoull((*it)[1].str())); } catch (...) { a.push_back(0); }
-    }
-    for (std::sregex_iterator it(right.begin(), right.end(), numberPattern), end; it != end; ++it) {
-        try { b.push_back(std::stoull((*it)[1].str())); } catch (...) { b.push_back(0); }
-    }
+    const auto components = [](const std::string& value) {
+        std::vector<unsigned long long> numbers;
+        for (size_t i = 0; i < value.size();) {
+            if (!std::isdigit(static_cast<unsigned char>(value[i]))) {
+                ++i;
+                continue;
+            }
+            unsigned long long number = 0;
+            while (i < value.size() && std::isdigit(static_cast<unsigned char>(value[i]))) {
+                const unsigned digit = static_cast<unsigned>(value[i] - '0');
+                number = number > (std::numeric_limits<unsigned long long>::max() - digit) / 10
+                    ? std::numeric_limits<unsigned long long>::max()
+                    : number * 10 + digit;
+                ++i;
+            }
+            numbers.push_back(number);
+        }
+        return numbers;
+    };
+    const auto a = components(left);
+    const auto b = components(right);
     if (a.empty() || b.empty()) return Lower(left) < Lower(right);
     const size_t count = std::max(a.size(), b.size());
     for (size_t i = 0; i < count; ++i) {
@@ -110,12 +222,13 @@ ModVersionInfo MakeVersionInfo(const std::string& label,
                                const fs::path& folder,
                                const fs::path& infoPath,
                                const fs::path& modRoot,
+                               const fs::path& metadataCacheDirectory,
                                const std::atomic<bool>& cancel) {
     ModVersionInfo version;
     version.folderLabel = label;
     version.folderPath = folder;
     version.infoPath = infoPath;
-    version.fields = ReadModInfo(infoPath, cancel);
+    version.fields = ReadModInfo(infoPath, cancel, metadataCacheDirectory);
     const auto poster = FindPoster(folder, modRoot, version.fields);
     if (poster) version.posterPath = fs::u8path(*poster);
     return version;
@@ -123,9 +236,13 @@ ModVersionInfo MakeVersionInfo(const std::string& label,
 
 ModEntry ScanModRoot(const fs::path& modRoot,
                      const std::string& workshopItemId,
+                     const fs::path& metadataCacheDirectory,
                      const std::atomic<bool>& cancel) {
     ModEntry entry;
     entry.folderPath = modRoot;
+    std::error_code modifiedError;
+    entry.folderModifiedTime = fs::last_write_time(modRoot, modifiedError);
+    if (modifiedError) entry.folderModifiedTime = fs::file_time_type::min();
     entry.folderName = PathToUtf8(modRoot.filename());
     entry.workshopItemId = workshopItemId;
     entry.name = entry.folderName;
@@ -134,13 +251,13 @@ ModEntry ScanModRoot(const fs::path& modRoot,
     // Legacy layouts may have mod.info directly in the mod root.
     const fs::path rootInfo = modRoot / "mod.info";
     if (IsRegularFile(rootInfo) && !cancel.load()) {
-        entry.versions.push_back(MakeVersionInfo("root", modRoot, rootInfo, modRoot, cancel));
+        entry.versions.push_back(MakeVersionInfo("root", modRoot, rootInfo, modRoot, metadataCacheDirectory, cancel));
     }
 
     const fs::path commonFolder = modRoot / "common";
     const fs::path commonInfo = commonFolder / "mod.info";
     if (IsRegularFile(commonInfo) && !cancel.load()) {
-        entry.versions.push_back(MakeVersionInfo("common", commonFolder, commonInfo, modRoot, cancel));
+        entry.versions.push_back(MakeVersionInfo("common", commonFolder, commonInfo, modRoot, metadataCacheDirectory, cancel));
     }
 
     std::error_code ec;
@@ -152,7 +269,7 @@ ModEntry ScanModRoot(const fs::path& modRoot,
         if (Lower(childName) == "common") continue;
         const fs::path info = it->path() / "mod.info";
         if (!IsRegularFile(info)) continue;
-        entry.versions.push_back(MakeVersionInfo(childName, it->path(), info, modRoot, cancel));
+        entry.versions.push_back(MakeVersionInfo(childName, it->path(), info, modRoot, metadataCacheDirectory, cancel));
     }
 
     // Root metadata is a fallback; versioned metadata is preferred, with the highest
@@ -235,7 +352,7 @@ std::vector<std::string> ReadDefaultModOrder(const fs::path& filePath, bool& fou
     bool inModsBlock = false;
     bool waitingForModsBrace = false;
     std::string line;
-    const std::regex modLine(R"(^\s*mod\s*=\s*(.*?)\s*,\s*$)", std::regex::icase);
+    static const std::regex modLine(R"(^\s*mod\s*=\s*(.*?)\s*,\s*$)", std::regex::icase);
     while (std::getline(input, line)) {
         const std::string trimmed = Trim(line);
         const std::string lower = Lower(trimmed);
@@ -283,18 +400,28 @@ void ApplyLoadOrder(std::vector<ModEntry>& mods,
 
 std::vector<ModEntry> ScanUserMods(const fs::path& root,
                                    const std::atomic<bool>& cancel,
-                                   const ProgressCallback& progress) {
+                                   const ProgressCallback& progress,
+                                   const fs::path& metadataCacheDirectory) {
     std::vector<ModEntry> mods;
     if (!IsDirectory(root)) return mods;
 
+    std::vector<fs::path> folders;
     std::error_code ec;
     fs::directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
     for (; !ec && it != end && !cancel.load(); it.increment(ec)) {
         std::error_code typeError;
         if (!it->is_directory(typeError) || typeError) continue;
-        if (progress) progress("Reading user mod: " + PathToUtf8(it->path().filename()));
-        mods.push_back(ScanModRoot(it->path(), {}, cancel));
+        folders.push_back(it->path());
     }
+    mods.resize(folders.size());
+    std::mutex progressMutex;
+    ParallelForEach(folders.size(), cancel, [&](size_t index) {
+        if (progress) {
+            std::lock_guard<std::mutex> lock(progressMutex);
+            progress("Reading user mod: " + PathToUtf8(folders[index].filename()));
+        }
+        mods[index] = ScanModRoot(folders[index], {}, metadataCacheDirectory, cancel);
+    });
     std::sort(mods.begin(), mods.end(), [](const auto& a, const auto& b) {
         const auto an = Lower(a.name);
         const auto bn = Lower(b.name);
@@ -306,10 +433,12 @@ std::vector<ModEntry> ScanUserMods(const fs::path& root,
 
 std::vector<ModEntry> ScanWorkshopMods(const fs::path& root,
                                        const std::atomic<bool>& cancel,
-                                       const ProgressCallback& progress) {
+                                       const ProgressCallback& progress,
+                                       const fs::path& metadataCacheDirectory) {
     std::vector<ModEntry> mods;
     if (!IsDirectory(root)) return mods;
 
+    std::vector<std::pair<fs::path, std::string>> folders;
     std::error_code workshopError;
     fs::directory_iterator workshopIt(root, fs::directory_options::skip_permission_denied, workshopError), end;
     for (; !workshopError && workshopIt != end && !cancel.load(); workshopIt.increment(workshopError)) {
@@ -328,10 +457,20 @@ std::vector<ModEntry> ScanWorkshopMods(const fs::path& root,
         for (; !modsError && modIt != modEnd && !cancel.load(); modIt.increment(modsError)) {
             std::error_code childTypeError;
             if (!modIt->is_directory(childTypeError) || childTypeError) continue;
-            if (progress) progress("Reading Workshop mod " + workshopId + ": " + PathToUtf8(modIt->path().filename()));
-            mods.push_back(ScanModRoot(modIt->path(), workshopId, cancel));
+            folders.emplace_back(modIt->path(), workshopId);
         }
     }
+
+    mods.resize(folders.size());
+    std::mutex progressMutex;
+    ParallelForEach(folders.size(), cancel, [&](size_t index) {
+        const auto& folder = folders[index];
+        if (progress) {
+            std::lock_guard<std::mutex> lock(progressMutex);
+            progress("Reading Workshop mod " + folder.second + ": " + PathToUtf8(folder.first.filename()));
+        }
+        mods[index] = ScanModRoot(folder.first, folder.second, metadataCacheDirectory, cancel);
+    });
 
     std::sort(mods.begin(), mods.end(), [](const auto& a, const auto& b) {
         const auto an = Lower(a.name);
@@ -442,7 +581,8 @@ std::string Join(const std::vector<std::string>& values, const std::string& sepa
 ScanResults ScanAll(const fs::path& userModsPath,
                     const fs::path& workshopPath,
                     const std::atomic<bool>& cancel,
-                    ProgressCallback progress) {
+                    ProgressCallback progress,
+                    const fs::path& metadataCacheDirectory) {
     ScanResults results;
     results.userModsPath = userModsPath;
     results.workshopPath = workshopPath;
@@ -451,11 +591,42 @@ ScanResults ScanAll(const fs::path& userModsPath,
     if (progress) progress("Reading default.txt load order…");
     results.defaultModIds = ReadDefaultModOrder(results.defaultTxtPath, results.defaultTxtFound);
     if (progress) progress("Scanning user mods folder…");
-    results.userMods = ScanUserMods(userModsPath, cancel, progress);
+    results.userMods = ScanUserMods(userModsPath, cancel, progress, metadataCacheDirectory);
     if (progress) progress("Scanning Steam Workshop folder…");
-    results.workshopMods = ScanWorkshopMods(workshopPath, cancel, progress);
+    results.workshopMods = ScanWorkshopMods(workshopPath, cancel, progress, metadataCacheDirectory);
     ApplyLoadOrder(results.userMods, results.defaultModIds);
     ApplyLoadOrder(results.workshopMods, results.defaultModIds);
+    std::unordered_map<std::string, size_t> localFolders;
+    std::unordered_map<std::string, std::vector<size_t>> localIds;
+    for (size_t i = 0; i < results.userMods.size(); ++i) {
+        const auto& local = results.userMods[i];
+        localFolders.emplace(NormalizeId(local.folderName), i);
+        if (!local.id.empty()) localIds[NormalizeId(local.id)].push_back(i);
+    }
+    for (auto& source : results.workshopMods) {
+        size_t localIndex = results.userMods.size();
+        const auto folder = localFolders.find(NormalizeId(source.folderName));
+        if (folder != localFolders.end()) {
+            localIndex = folder->second;
+        } else if (!source.id.empty()) {
+            const auto id = localIds.find(NormalizeId(source.id));
+            if (id != localIds.end()) {
+                if (id->second.size() != 1) {
+                    source.localMatchAmbiguous = true;
+                    continue;
+                }
+                localIndex = id->second.front();
+            }
+        }
+        if (localIndex >= results.userMods.size()) continue;
+
+        source.locallyInstalled = true;
+        auto& local = results.userMods[localIndex];
+        local.workshopCounterpartFound = true;
+        std::string reason;
+        local.workshopUpdateAvailable = local.workshopUpdateAvailable || IsUpdateAvailable(
+            source, local, UpdateMethod::ModInfoVersion, cancel, reason);
+    }
     if (!cancel.load()) {
         if (progress) progress("Writing custom.txt inventory…");
         results.customTxtWritten = WriteCustomInventory(userModsPath, results.userMods, results.customTxtWarning);
@@ -651,6 +822,68 @@ bool CopyDirectoryContents(const fs::path& source,
     if (ec) {
         errorMessage = "Folder traversal failed: " + ec.message();
         return false;
+    }
+    return true;
+}
+
+bool ReplaceDirectoryContents(const fs::path& source,
+                              const fs::path& destination,
+                              std::string& errorMessage,
+                              const std::atomic<bool>* cancel,
+                              ProgressCallback progress) {
+    const auto token = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    fs::path staging = destination;
+    staging += ".pzmm-stage-" + token;
+    fs::path backup = destination;
+    backup += ".pzmm-backup-" + token;
+
+    if (!CopyDirectoryContents(source, staging, errorMessage, cancel, std::move(progress))) {
+        std::error_code cleanupError;
+        fs::remove_all(staging, cleanupError);
+        return false;
+    }
+    if (cancel && cancel->load()) {
+        errorMessage = "Operation cancelled.";
+        std::error_code cleanupError;
+        fs::remove_all(staging, cleanupError);
+        return false;
+    }
+
+    std::error_code ec;
+    const bool destinationExists = fs::exists(destination, ec);
+    if (ec) {
+        errorMessage = "Could not check the existing destination: " + ec.message();
+        fs::remove_all(staging, ec);
+        return false;
+    }
+    if (destinationExists) {
+        fs::rename(destination, backup, ec);
+        if (ec) {
+            errorMessage = "Could not move the old mod folder aside: " + ec.message();
+            fs::remove_all(staging, ec);
+            return false;
+        }
+    }
+
+    fs::rename(staging, destination, ec);
+    if (ec) {
+        errorMessage = "Could not install the updated mod folder: " + ec.message();
+        if (destinationExists) {
+            std::error_code restoreError;
+            fs::rename(backup, destination, restoreError);
+            if (restoreError) errorMessage += " The old folder could not be restored: " + restoreError.message();
+        }
+        std::error_code cleanupError;
+        fs::remove_all(staging, cleanupError);
+        return false;
+    }
+
+    if (destinationExists) {
+        std::error_code cleanupError;
+        fs::remove_all(backup, cleanupError);
+        if (cleanupError)
+            errorMessage = "Update succeeded, but the old backup could not be removed at " +
+                           PathToUtf8(backup) + ": " + cleanupError.message();
     }
     return true;
 }

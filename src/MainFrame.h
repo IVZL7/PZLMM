@@ -7,6 +7,7 @@
 #include <memory>
 #include <map>
 #include <optional>
+#include <set>
 #include <thread>
 
 #include <wx/wx.h>
@@ -37,7 +38,19 @@ private:
         int sortColumn = 0;
         bool sortAscending = true;
         std::map<int, wxString> filters;
+        std::map<int, std::set<std::string>> valueFilters;
+        std::map<int, std::vector<std::pair<std::string, wxString>>> presetOptions;
         std::vector<wxString> columnTitles;
+    };
+
+    struct ImportPlan {
+        pzmm::fs::path temporaryRoot;
+        pzmm::fs::path userModsRoot;
+        pzmm::fs::path workshopRoot;
+        std::vector<pzmm::ModEntry> mods;
+        size_t skippedArchiveFiles = 0;
+        std::vector<std::string> archiveWarnings;
+        ~ImportPlan();
     };
 
     struct JobResult {
@@ -48,6 +61,7 @@ private:
         bool success = true;
         std::string message;
         pzmm::fs::path archivePath;
+        std::shared_ptr<ImportPlan> importPlan;
     };
 
     struct CopyJob {
@@ -63,13 +77,20 @@ private:
     void OnProgress(wxThreadEvent& event);
     void ReportProgress(const std::string& message);
     void OnProgressPulse(wxTimerEvent& event);
+    void OnSelectionSettled(wxTimerEvent& event);
     void OnColumnClick(PageKind kind, wxListEvent& event);
     void OnColumnRightClick(PageKind kind, wxListEvent& event);
+    void OnColumnFilter(PageKind kind, wxListEvent& event);
+    void OnApplyTypedFilter(PageKind kind, wxListEvent& event);
+    void OnClearTypedFilter(PageKind kind, wxListEvent& event);
     void OnListRightClick(PageKind kind, wxListEvent& event);
     void OnBrowseUserPath(wxCommandEvent& event);
     void OnBrowseWorkshopPath(wxCommandEvent& event);
+    void OnImportArchive(wxCommandEvent& event);
+    void ReviewImportPlan(const std::shared_ptr<ImportPlan>& plan);
     void OnCopySelected(wxCommandEvent& event);
     void OnUpdateSelected(wxCommandEvent& event);
+    void OnUpdateUserSelected(wxCommandEvent& event);
     void OnListSelection(PageKind kind, wxListEvent& event);
     void OnRefresh(wxCommandEvent& event);
 
@@ -77,11 +98,18 @@ private:
     void PopulateList(PageKind kind, PageWidgets& page, const std::vector<pzmm::ModEntry>& mods);
     void RefreshListView(PageKind kind, PageWidgets& page, const std::vector<pzmm::ModEntry>& mods);
     wxString ColumnValue(PageKind kind, const pzmm::ModEntry& mod, int column) const;
+    bool IsPresetFilterColumn(PageKind kind, int column) const;
+    std::vector<std::pair<std::string, wxString>> PresetFilterOptions(PageKind kind, int column) const;
+    bool MatchesPresetFilter(PageKind kind, const pzmm::ModEntry& mod, int column,
+                             const std::set<std::string>& selected) const;
     void UpdateDetails(PageKind kind, long row);
     wxString DescribeMod(const pzmm::ModEntry& entry, PageKind kind) const;
     void SetPoster(PageWidgets& page, const pzmm::fs::path& path);
     void SetBusy(bool busy);
     void StartCopyOrUpdate(bool updateOnly);
+    void StartUpdateFromUserSelection();
+    void RunCopyJobs(std::vector<CopyJob> jobs, bool updateOnly, pzmm::UpdateMethod method,
+                     const pzmm::fs::path& userRoot, const pzmm::fs::path& workshopRoot);
     void ArchiveSelectedMods(PageKind kind);
     void ShowArchiveNotification(const pzmm::fs::path& archivePath);
     void DeleteSelectedUserMods();
@@ -91,6 +119,7 @@ private:
     wxTextCtrl* m_userPathCtrl = nullptr;
     wxTextCtrl* m_workshopPathCtrl = nullptr;
     wxButton* m_refreshButton = nullptr;
+    wxButton* m_importButton = nullptr;
     wxButton* m_browseUserButton = nullptr;
     wxButton* m_browseWorkshopButton = nullptr;
     wxNotebook* m_notebook = nullptr;
@@ -98,13 +127,18 @@ private:
     wxStaticText* m_activityText = nullptr;
     wxGauge* m_progressGauge = nullptr;
     wxTimer m_progressTimer;
+    wxTimer m_selectionTimer;
+    PageKind m_pendingSelectionKind = PageKind::UserMods;
+    long m_pendingSelectionRow = -1;
 
     PageWidgets m_userPage;
     PageWidgets m_workshopPage;
 
     wxChoice* m_updateMethodChoice = nullptr;
+    wxChoice* m_userUpdateMethodChoice = nullptr;
     wxButton* m_copyButton = nullptr;
     wxButton* m_updateButton = nullptr;
+    wxButton* m_updateUserButton = nullptr;
 
     pzmm::ScanResults m_scanResults;
     bool m_hasScan = false;
