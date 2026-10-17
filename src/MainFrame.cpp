@@ -1,10 +1,10 @@
 #include "MainFrame.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
-#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -17,15 +17,29 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <cstdint>
 
 #include <wx/dirdlg.h>
+#include <wx/artprov.h>
 #include <wx/filedlg.h>
 #include <wx/filefn.h>
-#include <wx/mstream.h>
 #include <wx/utils.h>
 #include <wx/wfstream.h>
 #include <wx/zipstrm.h>
 #include <wx/stdpaths.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include <zlib.h>
+
+#ifdef _WIN32
+#include <commctrl.h>
+#endif
 
 wxDEFINE_EVENT(wxEVT_PZMM_JOB_DONE, wxThreadEvent);
 wxDEFINE_EVENT(wxEVT_PZMM_PROGRESS, wxThreadEvent);
@@ -338,24 +352,309 @@ bool OpenInExplorer(const pzmm::fs::path& path, bool selectFile = false) {
 #endif
 }
 
+struct ArchiveFile {
+    pzmm::fs::path path;
+    std::string entryName;
+};
+
+struct CompressedArchiveFile {
+    ArchiveFile file;
+    pzmm::fs::path compressedPath;
+    uint64_t uncompressedSize = 0;
+    uint64_t compressedSize = 0;
+    uint32_t crc = 0;
+    std::string error;
+};
+
+class CompressionScheduler {
+public:
+    explicit CompressionScheduler(size_t maximumWorkers) : m_maximumWorkers(maximumWorkers), m_workerLimit(maximumWorkers) {}
+
+    bool Acquire(const std::atomic<bool>& cancel, const std::atomic<bool>& stop) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        while (!cancel.load() && !stop.load()) {
+            UpdateWorkerLimit();
+            if (m_activeWorkers < m_workerLimit) {
+                ++m_activeWorkers;
+                return true;
+            }
+            m_condition.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    void Release() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_activeWorkers > 0) --m_activeWorkers;
+        }
+        m_condition.notify_all();
+    }
+
+    bool Checkpoint(const std::atomic<bool>& cancel, const std::atomic<bool>& stop) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        bool releasedSlot = false;
+        while (!cancel.load() && !stop.load()) {
+            UpdateWorkerLimit();
+            if (!releasedSlot && m_activeWorkers > m_workerLimit) {
+                --m_activeWorkers;
+                releasedSlot = true;
+                m_condition.notify_all();
+            }
+            if (releasedSlot && m_activeWorkers < m_workerLimit) {
+                ++m_activeWorkers;
+                return true;
+            }
+            if (!releasedSlot) return true;
+            m_condition.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        if (releasedSlot) ++m_activeWorkers;
+        return false;
+    }
+
+    void Wake() { m_condition.notify_all(); }
+
+private:
+    void UpdateWorkerLimit() {
+#ifdef _WIN32
+        const auto now = std::chrono::steady_clock::now();
+        if (m_lastSample.time_since_epoch().count() != 0 &&
+            now - m_lastSample < std::chrono::milliseconds(500)) return;
+        m_lastSample = now;
+
+        FILETIME idleTime{}, kernelTime{}, userTime{}, processCreate{}, processExit{}, processKernel{}, processUser{};
+        if (!GetSystemTimes(&idleTime, &kernelTime, &userTime) ||
+            !GetProcessTimes(GetCurrentProcess(), &processCreate, &processExit, &processKernel, &processUser)) return;
+
+        const auto value = [](const FILETIME& time) {
+            return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+        };
+        const uint64_t idle = value(idleTime);
+        const uint64_t kernel = value(kernelTime);
+        const uint64_t user = value(userTime);
+        const uint64_t process = value(processKernel) + value(processUser);
+        if (m_hasSample) {
+            const uint64_t totalDelta = (kernel - m_lastKernel) + (user - m_lastUser);
+            const uint64_t idleDelta = idle - m_lastIdle;
+            const uint64_t processDelta = process - m_lastProcess;
+            if (totalDelta > 0) {
+                const uint64_t busyDelta = totalDelta > idleDelta ? totalDelta - idleDelta : 0;
+                const uint64_t otherBusy = busyDelta > processDelta ? busyDelta - processDelta : 0;
+                const double otherLoad = static_cast<double>(otherBusy) / static_cast<double>(totalDelta);
+                if (otherLoad >= 0.75) m_workerLimit = std::max<size_t>(1, m_maximumWorkers / 4);
+                else if (otherLoad >= 0.55) m_workerLimit = std::max<size_t>(1, m_maximumWorkers / 2);
+                else if (otherLoad >= 0.35) m_workerLimit = std::max<size_t>(1, (m_maximumWorkers * 3) / 4);
+                else m_workerLimit = m_maximumWorkers;
+            }
+        }
+        m_lastIdle = idle;
+        m_lastKernel = kernel;
+        m_lastUser = user;
+        m_lastProcess = process;
+        m_hasSample = true;
+#endif
+    }
+
+    const size_t m_maximumWorkers;
+    size_t m_workerLimit;
+    size_t m_activeWorkers = 0;
+    std::mutex m_mutex;
+    std::condition_variable m_condition;
+#ifdef _WIN32
+    bool m_hasSample = false;
+    std::chrono::steady_clock::time_point m_lastSample{};
+    uint64_t m_lastIdle = 0;
+    uint64_t m_lastKernel = 0;
+    uint64_t m_lastUser = 0;
+    uint64_t m_lastProcess = 0;
+#endif
+};
+
+bool CompressArchiveFile(const ArchiveFile& file,
+                         const pzmm::fs::path& compressedPath,
+                         const std::atomic<bool>& cancel,
+                         CompressionScheduler* scheduler,
+                         const std::atomic<bool>* stop,
+                         CompressedArchiveFile& result) {
+    result.file = file;
+    result.compressedPath = compressedPath;
+    std::ifstream input(file.path, std::ios::binary);
+    std::ofstream output(compressedPath, std::ios::binary | std::ios::trunc);
+    if (!input || !output) {
+        result.error = "Could not open " + pzmm::PathToUtf8(file.path) + " for compression.";
+        return false;
+    }
+
+    z_stream stream{};
+    const int initResult = deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+    if (initResult != Z_OK) {
+        result.error = "Could not initialize Deflate compression.";
+        return false;
+    }
+
+    constexpr size_t bufferSize = 256 * 1024;
+    std::array<Bytef, bufferSize> inputBuffer{};
+    std::array<Bytef, bufferSize> outputBuffer{};
+    uLong crc = crc32(0L, Z_NULL, 0);
+    const auto fail = [&](const std::string& message) {
+        result.error = message;
+        deflateEnd(&stream);
+        output.close();
+        std::error_code removeError;
+        pzmm::fs::remove(compressedPath, removeError);
+        return false;
+    };
+
+    while (!cancel.load()) {
+        input.read(reinterpret_cast<char*>(inputBuffer.data()), static_cast<std::streamsize>(inputBuffer.size()));
+        const std::streamsize count = input.gcount();
+        if (count > 0) {
+            const auto inputCount = static_cast<uInt>(count);
+            crc = crc32(crc, inputBuffer.data(), inputCount);
+            result.uncompressedSize += static_cast<uint64_t>(count);
+            stream.next_in = inputBuffer.data();
+            stream.avail_in = inputCount;
+            do {
+                stream.next_out = outputBuffer.data();
+                stream.avail_out = static_cast<uInt>(outputBuffer.size());
+                const int status = deflate(&stream, Z_NO_FLUSH);
+                if (status != Z_OK) return fail("Deflate compression failed for " + pzmm::PathToUtf8(file.path) + ".");
+                const size_t produced = outputBuffer.size() - stream.avail_out;
+                if (produced != 0) {
+                    output.write(reinterpret_cast<const char*>(outputBuffer.data()), static_cast<std::streamsize>(produced));
+                    if (!output) return fail("Could not write compressed data for " + pzmm::PathToUtf8(file.path) + ".");
+                    result.compressedSize += produced;
+                }
+            } while (stream.avail_in != 0 || stream.avail_out == 0);
+            if (scheduler && stop && !scheduler->Checkpoint(cancel, *stop))
+                return fail(cancel.load() ? "Archive creation was cancelled." : "Archive compression was stopped.");
+        }
+        if (input.bad()) return fail("Could not read " + pzmm::PathToUtf8(file.path) + ".");
+        if (input.eof()) break;
+    }
+    if (cancel.load()) return fail("Archive creation was cancelled.");
+
+    int finishStatus = Z_OK;
+    while (finishStatus != Z_STREAM_END) {
+        stream.next_out = outputBuffer.data();
+        stream.avail_out = static_cast<uInt>(outputBuffer.size());
+        finishStatus = deflate(&stream, Z_FINISH);
+        if (finishStatus != Z_OK && finishStatus != Z_STREAM_END)
+            return fail("Could not finish Deflate compression for " + pzmm::PathToUtf8(file.path) + ".");
+        const size_t produced = outputBuffer.size() - stream.avail_out;
+        if (produced != 0) {
+            output.write(reinterpret_cast<const char*>(outputBuffer.data()), static_cast<std::streamsize>(produced));
+            if (!output) return fail("Could not write compressed data for " + pzmm::PathToUtf8(file.path) + ".");
+            result.compressedSize += produced;
+        }
+    }
+    deflateEnd(&stream);
+    output.close();
+    if (!output) {
+        result.error = "Could not finalize compressed data for " + pzmm::PathToUtf8(file.path) + ".";
+        return false;
+    }
+    result.crc = static_cast<uint32_t>(crc);
+    return true;
+}
+
+bool WriteZipU16(std::ostream& output, uint16_t value) {
+    const char bytes[] = {static_cast<char>(value), static_cast<char>(value >> 8)};
+    output.write(bytes, sizeof(bytes));
+    return static_cast<bool>(output);
+}
+
+bool WriteZipU32(std::ostream& output, uint32_t value) {
+    const char bytes[] = {static_cast<char>(value), static_cast<char>(value >> 8),
+                          static_cast<char>(value >> 16), static_cast<char>(value >> 24)};
+    output.write(bytes, sizeof(bytes));
+    return static_cast<bool>(output);
+}
+
+bool WriteZipU64(std::ostream& output, uint64_t value) {
+    return WriteZipU32(output, static_cast<uint32_t>(value)) &&
+           WriteZipU32(output, static_cast<uint32_t>(value >> 32));
+}
+
+struct ZipCentralRecord {
+    std::string name;
+    uint32_t crc = 0;
+    uint64_t compressedSize = 0;
+    uint64_t uncompressedSize = 0;
+    uint64_t localOffset = 0;
+};
+
+bool WriteZipEntry(std::ostream& output, const CompressedArchiveFile& file, ZipCentralRecord& record) {
+    if (file.file.entryName.size() > std::numeric_limits<uint16_t>::max()) return false;
+    const auto position = output.tellp();
+    if (position == std::streampos(-1)) return false;
+    record.name = file.file.entryName;
+    record.crc = file.crc;
+    record.compressedSize = file.compressedSize;
+    record.uncompressedSize = file.uncompressedSize;
+    record.localOffset = static_cast<uint64_t>(static_cast<std::streamoff>(position));
+
+    if (!WriteZipU32(output, 0x04034b50) || !WriteZipU16(output, 45) || !WriteZipU16(output, 0x0800) ||
+        !WriteZipU16(output, 8) || !WriteZipU16(output, 0) || !WriteZipU16(output, 0x0021) ||
+        !WriteZipU32(output, record.crc) || !WriteZipU32(output, 0xffffffff) ||
+        !WriteZipU32(output, 0xffffffff) || !WriteZipU16(output, static_cast<uint16_t>(record.name.size())) ||
+        !WriteZipU16(output, 20)) return false;
+    output.write(record.name.data(), static_cast<std::streamsize>(record.name.size()));
+    if (!WriteZipU16(output, 1) || !WriteZipU16(output, 16) ||
+        !WriteZipU64(output, record.uncompressedSize) || !WriteZipU64(output, record.compressedSize)) return false;
+
+    std::ifstream compressed(file.compressedPath, std::ios::binary);
+    if (!compressed) return false;
+    std::array<char, 256 * 1024> buffer{};
+    while (compressed.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || compressed.gcount() > 0) {
+        output.write(buffer.data(), compressed.gcount());
+        if (!output) return false;
+    }
+    return !compressed.bad();
+}
+
+bool WriteZipCentralDirectory(std::ostream& output, const std::vector<ZipCentralRecord>& records) {
+    const auto directoryStart = output.tellp();
+    if (directoryStart == std::streampos(-1)) return false;
+    for (const auto& record : records) {
+        if (record.name.size() > std::numeric_limits<uint16_t>::max() ||
+            !WriteZipU32(output, 0x02014b50) || !WriteZipU16(output, 45) || !WriteZipU16(output, 45) ||
+            !WriteZipU16(output, 0x0800) || !WriteZipU16(output, 8) || !WriteZipU16(output, 0) ||
+            !WriteZipU16(output, 0x0021) || !WriteZipU32(output, record.crc) ||
+            !WriteZipU32(output, 0xffffffff) || !WriteZipU32(output, 0xffffffff) ||
+            !WriteZipU16(output, static_cast<uint16_t>(record.name.size())) || !WriteZipU16(output, 28) ||
+            !WriteZipU16(output, 0) || !WriteZipU16(output, 0) || !WriteZipU16(output, 0) ||
+            !WriteZipU32(output, 0) || !WriteZipU32(output, 0xffffffff)) return false;
+        output.write(record.name.data(), static_cast<std::streamsize>(record.name.size()));
+        if (!WriteZipU16(output, 1) || !WriteZipU16(output, 24) ||
+            !WriteZipU64(output, record.uncompressedSize) || !WriteZipU64(output, record.compressedSize) ||
+            !WriteZipU64(output, record.localOffset)) return false;
+    }
+    const auto directoryEnd = output.tellp();
+    if (directoryEnd == std::streampos(-1)) return false;
+    const uint64_t directoryOffset = static_cast<uint64_t>(static_cast<std::streamoff>(directoryStart));
+    const uint64_t directorySize = static_cast<uint64_t>(static_cast<std::streamoff>(directoryEnd - directoryStart));
+    const uint64_t zip64Offset = static_cast<uint64_t>(static_cast<std::streamoff>(directoryEnd));
+    const uint64_t count = records.size();
+
+    return WriteZipU32(output, 0x06064b50) && WriteZipU64(output, 44) &&
+           WriteZipU16(output, 45) && WriteZipU16(output, 45) &&
+           WriteZipU32(output, 0) && WriteZipU32(output, 0) &&
+           WriteZipU64(output, count) && WriteZipU64(output, count) &&
+           WriteZipU64(output, directorySize) && WriteZipU64(output, directoryOffset) &&
+           WriteZipU32(output, 0x07064b50) && WriteZipU32(output, 0) &&
+           WriteZipU64(output, zip64Offset) && WriteZipU32(output, 1) &&
+           WriteZipU32(output, 0x06054b50) && WriteZipU16(output, 0) && WriteZipU16(output, 0) &&
+           WriteZipU16(output, 0xffff) && WriteZipU16(output, 0xffff) &&
+           WriteZipU32(output, 0xffffffff) && WriteZipU32(output, 0xffffffff) && WriteZipU16(output, 0);
+}
+
 bool CreateModArchive(const std::vector<pzmm::ModEntry>& mods,
                       const pzmm::fs::path& outputFolder,
                       const std::atomic<bool>& cancel,
                       const pzmm::ProgressCallback& progress,
                       pzmm::fs::path& archivePath,
                       std::string& error) {
-    struct ArchiveFile {
-        pzmm::fs::path path;
-        std::string entryName;
-    };
-    struct PreparedFile {
-        ArchiveFile file;
-        std::vector<char> content;
-        uintmax_t reservedBytes = 0;
-        std::string error;
-        bool buffered = false;
-    };
-
     std::error_code ec;
     pzmm::fs::create_directories(outputFolder, ec);
     if (ec) {
@@ -413,169 +712,168 @@ bool CreateModArchive(const std::vector<pzmm::ModEntry>& mods,
         return false;
     }
 
-    bool archiveCreated = false;
+    std::error_code tempError;
+    const auto tempRoot = pzmm::fs::temp_directory_path(tempError) /
+        pzmm::fs::u8path("PZModManagerZip-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    if (tempError) {
+        error = "Could not locate a temporary folder for ZIP compression.";
+        return false;
+    }
+    pzmm::fs::create_directories(tempRoot, tempError);
+    if (tempError) {
+        error = "Could not create temporary compression files: " + tempError.message();
+        return false;
+    }
+    struct TempCleanup {
+        pzmm::fs::path path;
+        ~TempCleanup() { std::error_code ec; pzmm::fs::remove_all(path, ec); }
+    } cleanup{tempRoot};
+
+    const auto markerPath = tempRoot / "archive-marker.txt";
     {
-        wxFileOutputStream output(PathToWx(archivePath));
-        if (!output.IsOk()) {
-            error = "Could not create " + pzmm::PathToUtf8(archivePath) + ".";
-        } else {
-            wxZipOutputStream zip(output);
-            zip.SetLevel(1);
-            if (!zip.PutNextEntry(FromUtf8(kModArchiveMarkerPath))) {
-                error = "Could not mark the ZIP as a Project Zomboid mod archive.";
-            } else {
-                wxMemoryInputStream markerInput(kModArchiveMarkerText, std::strlen(kModArchiveMarkerText));
-                zip.Write(markerInput);
-                if (!zip.IsOk()) error = "Could not write the mod archive marker.";
-            }
-            constexpr uintmax_t maxBufferedBytes = 64ULL * 1024 * 1024;
-            const unsigned int detectedThreads = std::thread::hardware_concurrency();
-            const size_t hardwareThreads = detectedThreads == 0 ? 2 : detectedThreads;
-            const size_t readerLimit = hardwareThreads > 3 ? hardwareThreads - 3 : 1;
-            const size_t readerCount = std::min(files.size(), readerLimit);
-            std::mutex mutex;
-            std::condition_variable readyCondition;
-            std::condition_variable capacityCondition;
-            std::deque<PreparedFile> ready;
-            uintmax_t bufferedBytes = 0;
-            size_t nextFile = 0;
-            size_t activeReaders = readerCount;
-            std::atomic<bool> stopReaders{!error.empty()};
-
-            const auto reader = [&]() {
-                while (!cancel.load() && !stopReaders.load()) {
-                    size_t index = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        if (nextFile >= files.size()) break;
-                        index = nextFile++;
-                    }
-
-                    PreparedFile prepared;
-                    prepared.file = files[index];
-                    std::error_code sizeError;
-                    const uintmax_t size = pzmm::fs::file_size(prepared.file.path, sizeError);
-                    if (sizeError) {
-                        prepared.error = "Could not inspect " + pzmm::PathToUtf8(prepared.file.path) +
-                                         ": " + sizeError.message();
-                    } else if (size <= maxBufferedBytes &&
-                               size <= static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
-                        std::unique_lock<std::mutex> lock(mutex);
-                        capacityCondition.wait(lock, [&]() {
-                            return cancel.load() || stopReaders.load() || bufferedBytes == 0 ||
-                                   bufferedBytes + size <= maxBufferedBytes;
-                        });
-                        if (cancel.load() || stopReaders.load()) break;
-                        bufferedBytes += size;
-                        prepared.reservedBytes = size;
-                        prepared.buffered = true;
-                        lock.unlock();
-
-                        try {
-                            prepared.content.resize(static_cast<size_t>(size));
-                            std::ifstream input(prepared.file.path, std::ios::binary);
-                            if (!input || (size > 0 &&
-                                (!input.read(prepared.content.data(), static_cast<std::streamsize>(size)) ||
-                                 static_cast<uintmax_t>(input.gcount()) != size))) {
-                                prepared.error = "Could not read " + pzmm::PathToUtf8(prepared.file.path) + ".";
-                            }
-                        } catch (const std::exception& exception) {
-                            prepared.error = "Could not buffer " + pzmm::PathToUtf8(prepared.file.path) +
-                                             ": " + exception.what();
-                        }
-                    }
-
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        ready.push_back(std::move(prepared));
-                    }
-                    readyCondition.notify_one();
-                }
-                {
-                    std::lock_guard<std::mutex> lock(mutex);
-                    --activeReaders;
-                }
-                readyCondition.notify_one();
-                capacityCondition.notify_all();
-            };
-
-            std::vector<std::thread> readers;
-            readers.reserve(readerCount);
-            for (size_t i = 0; i < readerCount; ++i) readers.emplace_back(reader);
-
-            size_t archivedFiles = 0;
-            bool writerFailed = !error.empty();
-            while (true) {
-                PreparedFile prepared;
-                {
-                    std::unique_lock<std::mutex> lock(mutex);
-                    readyCondition.wait(lock, [&]() { return !ready.empty() || activeReaders == 0; });
-                    if (ready.empty() && activeReaders == 0) break;
-                    prepared = std::move(ready.front());
-                    ready.pop_front();
-                }
-
-                if (!writerFailed && !cancel.load()) {
-                    if (!prepared.error.empty()) {
-                        error = prepared.error;
-                        writerFailed = true;
-                        stopReaders.store(true);
-                        capacityCondition.notify_all();
-                    } else {
-                        if (progress) progress("Archiving: " + prepared.file.entryName);
-                        if (!zip.PutNextEntry(FromUtf8(prepared.file.entryName))) {
-                            error = "Could not add " + prepared.file.entryName + " to the archive.";
-                            writerFailed = true;
-                            stopReaders.store(true);
-                            capacityCondition.notify_all();
-                        } else if (prepared.buffered) {
-                            wxMemoryInputStream input(prepared.content.data(), prepared.content.size());
-                            zip.Write(input);
-                            if (!zip.IsOk()) {
-                                error = "Writing the archive failed while adding " + prepared.file.entryName + ".";
-                                writerFailed = true;
-                            }
-                        } else {
-                            wxFileInputStream input(PathToWx(prepared.file.path));
-                            if (!input.IsOk()) {
-                                error = "Could not read " + pzmm::PathToUtf8(prepared.file.path) + ".";
-                                writerFailed = true;
-                            } else {
-                                zip.Write(input);
-                                if (!zip.IsOk()) {
-                                    error = "Writing the archive failed while adding " + prepared.file.entryName + ".";
-                                    writerFailed = true;
-                                }
-                            }
-                        }
-                        if (writerFailed) {
-                            stopReaders.store(true);
-                            capacityCondition.notify_all();
-                        } else {
-                            ++archivedFiles;
-                        }
-                    }
-                }
-                if (prepared.reservedBytes != 0) {
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        bufferedBytes -= prepared.reservedBytes;
-                    }
-                    capacityCondition.notify_all();
-                }
-            }
-
-            stopReaders.store(true);
-            capacityCondition.notify_all();
-            for (auto& thread : readers) thread.join();
-            if (cancel.load()) error = "Archive creation was cancelled.";
-            if (error.empty() && archivedFiles == 0) error = "No files were found in the selected mod folder(s).";
-            const bool zipClosed = zip.Close();
-            if (error.empty() && (!zipClosed || !output.IsOk())) error = "Finalizing the ZIP archive failed.";
-            archiveCreated = error.empty();
+        std::ofstream marker(markerPath, std::ios::binary | std::ios::trunc);
+        marker << kModArchiveMarkerText;
+        if (!marker) {
+            error = "Could not write the mod archive marker.";
+            return false;
         }
     }
-    if (!archiveCreated) {
+    files.insert(files.begin(), {markerPath, kModArchiveMarkerPath});
+
+    std::ofstream output(archivePath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error = "Could not create " + pzmm::PathToUtf8(archivePath) + ".";
+        return false;
+    }
+
+    const unsigned int detectedThreads = std::thread::hardware_concurrency();
+    const size_t hardwareThreads = detectedThreads == 0 ? 2 : detectedThreads;
+    const size_t maxCompressionWorkers = hardwareThreads > 1 ? hardwareThreads - 1 : 0;
+    std::vector<ZipCentralRecord> records;
+    records.reserve(files.size());
+    size_t archivedFiles = 0;
+    bool writerFailed = false;
+
+    const auto compressAndWrite = [&](size_t index) {
+        CompressedArchiveFile compressed;
+        const auto compressedPath = tempRoot / (std::to_string(index) + ".deflate");
+        if (!CompressArchiveFile(files[index], compressedPath, cancel, nullptr, nullptr, compressed)) {
+            error = compressed.error;
+            return false;
+        }
+        if (progress) progress("Archiving: " + files[index].entryName);
+        ZipCentralRecord record;
+        if (!WriteZipEntry(output, compressed, record)) {
+            error = "Could not write ZIP entry " + files[index].entryName + ".";
+            return false;
+        }
+        records.push_back(std::move(record));
+        ++archivedFiles;
+        std::error_code removeError;
+        pzmm::fs::remove(compressedPath, removeError);
+        return true;
+    };
+
+    const size_t workerCount = std::min(files.size(), maxCompressionWorkers);
+    if (workerCount == 0) {
+        for (size_t i = 0; i < files.size() && !cancel.load(); ++i) {
+            if (!compressAndWrite(i)) {
+                writerFailed = true;
+                break;
+            }
+        }
+    } else {
+        CompressionScheduler scheduler(workerCount);
+        std::atomic<size_t> nextFile{0};
+        std::atomic<bool> stopWorkers{false};
+        std::mutex readyMutex;
+        std::condition_variable readyCondition;
+        std::deque<CompressedArchiveFile> ready;
+        size_t activeWorkers = workerCount;
+
+        const auto worker = [&]() {
+            while (scheduler.Acquire(cancel, stopWorkers)) {
+                const size_t index = nextFile.fetch_add(1);
+                if (index >= files.size()) {
+                    scheduler.Release();
+                    break;
+                }
+                CompressedArchiveFile result;
+                const auto compressedPath = tempRoot / (std::to_string(index) + ".deflate");
+                CompressArchiveFile(files[index], compressedPath, cancel, &scheduler, &stopWorkers, result);
+                scheduler.Release();
+                {
+                    std::lock_guard<std::mutex> lock(readyMutex);
+                    ready.push_back(std::move(result));
+                }
+                readyCondition.notify_one();
+            }
+            {
+                std::lock_guard<std::mutex> lock(readyMutex);
+                --activeWorkers;
+            }
+            readyCondition.notify_one();
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        for (size_t i = 0; i < workerCount; ++i) workers.emplace_back(worker);
+
+        while (true) {
+            CompressedArchiveFile result;
+            {
+                std::unique_lock<std::mutex> lock(readyMutex);
+                readyCondition.wait(lock, [&]() { return !ready.empty() || activeWorkers == 0; });
+                if (ready.empty() && activeWorkers == 0) break;
+                result = std::move(ready.front());
+                ready.pop_front();
+            }
+            if (!writerFailed && !cancel.load()) {
+                if (!result.error.empty()) {
+                    error = result.error;
+                    writerFailed = true;
+                    stopWorkers.store(true);
+                    scheduler.Wake();
+                } else {
+                    if (progress) progress("Archiving: " + result.file.entryName);
+                    ZipCentralRecord record;
+                    if (!WriteZipEntry(output, result, record)) {
+                        error = "Could not write ZIP entry " + result.file.entryName + ".";
+                        writerFailed = true;
+                        stopWorkers.store(true);
+                        scheduler.Wake();
+                    } else {
+                        records.push_back(std::move(record));
+                        ++archivedFiles;
+                        std::error_code removeError;
+                        pzmm::fs::remove(result.compressedPath, removeError);
+                    }
+                }
+            }
+        }
+        stopWorkers.store(true);
+        scheduler.Wake();
+        for (auto& thread : workers) thread.join();
+    }
+
+    if (cancel.load()) error = "Archive creation was cancelled.";
+    if (error.empty() && (writerFailed || archivedFiles != files.size()))
+        error = "Not all files could be compressed into the archive.";
+    if (error.empty() && !WriteZipCentralDirectory(output, records))
+        error = "Could not finalize the ZIP central directory.";
+    output.flush();
+    if (error.empty() && !output) error = "Finalizing the ZIP archive failed.";
+    output.close();
+    if (error.empty() && !output) error = "Could not close the ZIP archive.";
+    if (!error.empty()) {
+        std::error_code removeError;
+        pzmm::fs::remove(archivePath, removeError);
+        return false;
+    }
+    const auto verification = InspectModArchive(archivePath);
+    if (!verification.marked || verification.modRoots.size() != archiveRoots.size()) {
+        error = "The completed ZIP failed its archive-marker/entry verification.";
         std::error_code removeError;
         pzmm::fs::remove(archivePath, removeError);
         return false;
@@ -608,8 +906,10 @@ MainFrame::MainFrame()
     title->SetFont(titleFont);
     headerSizer->Add(title, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, 6);
     m_importButton = new wxButton(root, wxID_ANY, "Import ZIP...");
+    m_importButton->SetBitmap(wxArtProvider::GetBitmap(wxART_FILE_OPEN, wxART_BUTTON, wxSize(16, 16)));
     headerSizer->Add(m_importButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
     m_refreshButton = new wxButton(root, wxID_ANY, "Refresh scan");
+    m_refreshButton->SetBitmap(wxArtProvider::GetBitmap(wxART_REFRESH, wxART_BUTTON, wxSize(16, 16)));
     headerSizer->Add(m_refreshButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
     rootSizer->Add(headerSizer, 0, wxEXPAND | wxALL, 8);
 
@@ -619,12 +919,14 @@ MainFrame::MainFrame()
     m_userPathCtrl = new wxTextCtrl(root, wxID_ANY, DefaultUserModsPath());
     pathSizer->Add(m_userPathCtrl, 1, wxEXPAND);
     m_browseUserButton = new wxButton(root, wxID_ANY, "Browse...");
+    m_browseUserButton->SetBitmap(wxArtProvider::GetBitmap(wxART_FOLDER, wxART_BUTTON, wxSize(16, 16)));
     pathSizer->Add(m_browseUserButton, 0);
 
     pathSizer->Add(new wxStaticText(root, wxID_ANY, "Steam Workshop folder:"), 0, wxALIGN_CENTER_VERTICAL);
     m_workshopPathCtrl = new wxTextCtrl(root, wxID_ANY, DefaultWorkshopPath());
     pathSizer->Add(m_workshopPathCtrl, 1, wxEXPAND);
     m_browseWorkshopButton = new wxButton(root, wxID_ANY, "Browse...");
+    m_browseWorkshopButton->SetBitmap(wxArtProvider::GetBitmap(wxART_FOLDER, wxART_BUTTON, wxSize(16, 16)));
     pathSizer->Add(m_browseWorkshopButton, 0);
     rootSizer->Add(pathSizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
 
@@ -656,6 +958,8 @@ MainFrame::MainFrame()
     Bind(wxEVT_PZMM_PROGRESS, &MainFrame::OnProgress, this);
     Bind(wxEVT_TIMER, &MainFrame::OnProgressPulse, this, m_progressTimer.GetId());
     Bind(wxEVT_TIMER, &MainFrame::OnSelectionSettled, this, m_selectionTimer.GetId());
+    Bind(wxEVT_SYS_COLOUR_CHANGED, &MainFrame::OnSystemColourChanged, this);
+    ApplySystemTheme();
 
     StartScan();
 }
@@ -673,6 +977,14 @@ MainFrame::PageWidgets MainFrame::BuildListPage(PageKind kind) {
     widgets.panel = new wxPanel(m_notebook);
     auto* outerSizer = new wxBoxSizer(wxVERTICAL);
     auto* contentSizer = new wxBoxSizer(wxHORIZONTAL);
+
+    widgets.filterBar = new wxScrolledWindow(widgets.panel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                              wxHSCROLL | wxBORDER_NONE);
+    widgets.filterBar->SetScrollRate(8, 0);
+    widgets.filterBar->SetMinSize(wxSize(-1, 34));
+    widgets.filterSizer = new wxBoxSizer(wxHORIZONTAL);
+    widgets.filterBar->SetSizer(widgets.filterSizer);
+    outerSizer->Add(widgets.filterBar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 5);
 
     widgets.list = new wxListCtrl(widgets.panel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                   wxLC_REPORT | wxLC_HRULES | wxLC_VRULES);
@@ -717,7 +1029,9 @@ MainFrame::PageWidgets MainFrame::BuildListPage(PageKind kind) {
         m_updateMethodChoice->SetSelection(0);
         actionSizer->Add(m_updateMethodChoice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
         m_copyButton = new wxButton(widgets.panel, wxID_ANY, "Copy Selected");
+        m_copyButton->SetBitmap(wxArtProvider::GetBitmap(wxART_COPY, wxART_BUTTON, wxSize(16, 16)));
         m_updateButton = new wxButton(widgets.panel, wxID_ANY, "Update if Newer");
+        m_updateButton->SetBitmap(wxArtProvider::GetBitmap(wxART_REDO, wxART_BUTTON, wxSize(16, 16)));
         actionSizer->Add(m_copyButton, 0, wxRIGHT, 6);
         actionSizer->Add(m_updateButton, 0, wxRIGHT, 5);
         outerSizer->Add(actionSizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
@@ -733,6 +1047,7 @@ MainFrame::PageWidgets MainFrame::BuildListPage(PageKind kind) {
         m_userUpdateMethodChoice->SetSelection(0);
         actionSizer->Add(m_userUpdateMethodChoice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
         m_updateUserButton = new wxButton(widgets.panel, wxID_ANY, "Update selected if newer");
+        m_updateUserButton->SetBitmap(wxArtProvider::GetBitmap(wxART_REDO, wxART_BUTTON, wxSize(16, 16)));
         actionSizer->Add(m_updateUserButton, 0, wxRIGHT, 5);
         outerSizer->Add(actionSizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
         m_updateUserButton->Bind(wxEVT_BUTTON, &MainFrame::OnUpdateUserSelected, this);
@@ -741,9 +1056,6 @@ MainFrame::PageWidgets MainFrame::BuildListPage(PageKind kind) {
     widgets.panel->SetSizer(outerSizer);
     widgets.list->Bind(wxEVT_LIST_COL_CLICK, [this, kind](wxListEvent& event) {
         OnColumnClick(kind, event);
-    });
-    widgets.list->Bind(wxEVT_LIST_COL_RIGHT_CLICK, [this, kind](wxListEvent& event) {
-        OnColumnRightClick(kind, event);
     });
     widgets.list->Bind(wxEVT_LIST_ITEM_RIGHT_CLICK, [this, kind](wxListEvent& event) {
         OnListRightClick(kind, event);
@@ -857,6 +1169,25 @@ void MainFrame::OnProgressPulse(wxTimerEvent&) {
     if (m_busy && m_progressGauge) m_progressGauge->Pulse();
 }
 
+void MainFrame::OnSystemColourChanged(wxSysColourChangedEvent& event) {
+    event.Skip();
+    ApplySystemTheme();
+}
+
+void MainFrame::ApplySystemTheme() {
+    const bool dark = wxSystemSettings::GetAppearance().IsDark();
+    const wxColour background = dark ? wxColour(32, 32, 32) : wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW);
+    const wxColour foreground = dark ? wxColour(240, 240, 240) : wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT);
+    std::function<void(wxWindow*)> apply = [&](wxWindow* window) {
+        window->SetBackgroundColour(background);
+        window->SetForegroundColour(foreground);
+        for (auto child = window->GetChildren().GetFirst(); child; child = child->GetNext())
+            apply(child->GetData());
+        window->Refresh(false);
+    };
+    apply(this);
+}
+
 void MainFrame::OnColumnClick(PageKind kind, wxListEvent& event) {
     PageWidgets* page = kind == PageKind::UserMods ? &m_userPage : &m_workshopPage;
     const int col = event.GetColumn();
@@ -865,82 +1196,6 @@ void MainFrame::OnColumnClick(PageKind kind, wxListEvent& event) {
     else { page->sortColumn = col; page->sortAscending = true; }
     const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
     RefreshListView(kind, *page, mods);
-}
-
-void MainFrame::OnColumnRightClick(PageKind kind, wxListEvent& event) {
-    PageWidgets* page = kind == PageKind::UserMods ? &m_userPage : &m_workshopPage;
-    const int col = event.GetColumn();
-    if (col < 0 || static_cast<size_t>(col) >= page->columnTitles.size()) return;
-    wxMenu menu;
-    bool hasItems = false;
-    const bool presetColumn = IsPresetFilterColumn(kind, col);
-    std::map<int, std::string> presetItemKeys;
-    if (presetColumn) {
-        const auto options = page->presetOptions.find(col);
-        const auto current = page->valueFilters.find(col);
-        int optionId = 8000;
-        if (options == page->presetOptions.end() || options->second.empty()) {
-            menu.Append(wxID_ANY, "No values available")->Enable(false);
-            hasItems = true;
-        }
-        if (options != page->presetOptions.end()) for (const auto& option : options->second) {
-            auto* item = menu.AppendCheckItem(optionId, option.second);
-            if (current != page->valueFilters.end() && current->second.count(option.first)) item->Check(true);
-            presetItemKeys.emplace(optionId, option.first);
-            ++optionId;
-            hasItems = true;
-        }
-    } else {
-        menu.Append(7101, "Filter by substring...");
-        hasItems = true;
-    }
-
-    const bool hasColumnFilter = page->filters.count(col) || page->valueFilters.count(col);
-    const bool hasAnyFilter = !page->filters.empty() || !page->valueFilters.empty();
-    if (hasColumnFilter) {
-        if (hasItems) menu.AppendSeparator();
-        menu.Append(7102, "Clear this column filter");
-        hasItems = true;
-    }
-    if (hasAnyFilter) {
-        if (hasItems) menu.AppendSeparator();
-        menu.Append(7103, "Clear all filters");
-    }
-    menu.Bind(wxEVT_MENU, [this, page, kind, col, presetItemKeys](wxCommandEvent& command) {
-        const int id = command.GetId();
-        const auto option = presetItemKeys.find(id);
-        if (option != presetItemKeys.end()) {
-            auto& selected = page->valueFilters[col];
-            if (command.IsChecked()) selected.insert(option->second);
-            else selected.erase(option->second);
-            if (selected.empty()) page->valueFilters.erase(col);
-            const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
-            RefreshListView(kind, *page, mods);
-            return;
-        }
-        if (command.GetId() == 7101) {
-            wxTextEntryDialog dialog(this, "Show rows where this column contains:",
-                                     "Filter: " + page->columnTitles[col], page->filters[col]);
-            if (dialog.ShowModal() == wxID_OK) {
-                const wxString value = dialog.GetValue().Lower();
-                if (value.empty()) page->filters.erase(col);
-                else page->filters[col] = value;
-                const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
-                RefreshListView(kind, *page, mods);
-            }
-        } else if (command.GetId() == 7102) {
-            page->filters.erase(col);
-            page->valueFilters.erase(col);
-            const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
-            RefreshListView(kind, *page, mods);
-        } else if (command.GetId() == 7103) {
-            page->filters.clear();
-            page->valueFilters.clear();
-            const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
-            RefreshListView(kind, *page, mods);
-        }
-    });
-    PopupMenu(&menu);
 }
 
 void MainFrame::OnListRightClick(PageKind kind, wxListEvent& event) {
@@ -960,17 +1215,22 @@ void MainFrame::OnListRightClick(PageKind kind, wxListEvent& event) {
     if (sourceIndex >= mods.size()) return;
     const auto folderPath = mods[sourceIndex].folderPath;
     wxMenu menu;
-    menu.Append(7200, "Show in Explorer");
-    menu.Append(7204, "Archive selected mod(s) to ZIP...");
+    auto* revealItem = menu.Append(7200, "Show in Explorer");
+    revealItem->SetBitmap(wxArtProvider::GetBitmap(wxART_FOLDER_OPEN, wxART_MENU, wxSize(16, 16)));
+    auto* archiveItem = menu.Append(7204, "Archive selected mod(s) to ZIP...");
+    archiveItem->SetBitmap(wxArtProvider::GetBitmap(wxART_FILE_SAVE, wxART_MENU, wxSize(16, 16)));
     menu.AppendSeparator();
     menu.Bind(wxEVT_MENU, [folderPath](wxCommandEvent&) { OpenInExplorer(folderPath); }, 7200);
     menu.Bind(wxEVT_MENU, [this, kind](wxCommandEvent&) { ArchiveSelectedMods(kind); }, 7204);
     if (kind == PageKind::UserMods) {
-        menu.Append(7201, "Delete selected mod(s)...");
+        auto* deleteItem = menu.Append(7201, "Delete selected mod(s)...");
+        deleteItem->SetBitmap(wxArtProvider::GetBitmap(wxART_DELETE, wxART_MENU, wxSize(16, 16)));
         menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { DeleteSelectedUserMods(); }, 7201);
     } else {
-        menu.Append(7202, "Copy selected mod(s)...");
-        menu.Append(7203, "Update selected if newer...");
+        auto* copyItem = menu.Append(7202, "Copy selected mod(s)...");
+        copyItem->SetBitmap(wxArtProvider::GetBitmap(wxART_COPY, wxART_MENU, wxSize(16, 16)));
+        auto* updateItem = menu.Append(7203, "Update selected if newer...");
+        updateItem->SetBitmap(wxArtProvider::GetBitmap(wxART_REDO, wxART_MENU, wxSize(16, 16)));
         menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { StartCopyOrUpdate(false); }, 7202);
         menu.Bind(wxEVT_MENU, [this](wxCommandEvent&) { StartCopyOrUpdate(true); }, 7203);
     }
@@ -1080,6 +1340,140 @@ bool MainFrame::MatchesPresetFilter(PageKind kind, const pzmm::ModEntry& mod, in
             : (mod.workshopUpdateAvailable ? "update:available" : "update:current");
     }
     return !key.empty() && selected.count(key) != 0;
+}
+
+void MainFrame::RefreshFilterBar(PageKind kind, PageWidgets& page) {
+    page.filterSizer->Clear(true);
+    for (size_t column = 0; column < page.columnTitles.size(); ++column) {
+        const int index = static_cast<int>(column);
+        const auto textFilter = page.filters.find(index);
+        const auto valueFilter = page.valueFilters.find(index);
+        if (textFilter == page.filters.end() && valueFilter == page.valueFilters.end()) continue;
+
+        wxString value;
+        if (textFilter != page.filters.end()) {
+            value = textFilter->second;
+        } else if (valueFilter->second.size() == 1) {
+            const auto options = page.presetOptions.find(index);
+            if (options != page.presetOptions.end()) {
+                for (const auto& option : options->second) {
+                    if (valueFilter->second.count(option.first)) {
+                        value = option.second;
+                        break;
+                    }
+                }
+            }
+        } else {
+            value = FromUtf8(std::to_string(valueFilter->second.size()) + " selected");
+        }
+
+        auto* chip = new wxPanel(page.filterBar);
+        auto* chipSizer = new wxBoxSizer(wxHORIZONTAL);
+        auto* openButton = new wxButton(chip, wxID_ANY, page.columnTitles[index] + ": " + value,
+                                        wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+        openButton->SetBitmap(wxArtProvider::GetBitmap(wxART_GO_DOWN, wxART_BUTTON, wxSize(12, 12)));
+        openButton->SetBitmapPosition(wxRIGHT);
+        chipSizer->Add(openButton, 0, wxALIGN_CENTER_VERTICAL);
+        auto* closeButton = new wxButton(chip, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(24, 24), wxBU_EXACTFIT);
+        closeButton->SetBitmap(wxArtProvider::GetBitmap(wxART_CROSS_MARK, wxART_BUTTON, wxSize(12, 12)));
+        closeButton->SetToolTip("Remove this filter");
+        chipSizer->Add(closeButton, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 2);
+        chip->SetSizer(chipSizer);
+        page.filterSizer->Add(chip, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+
+        PageWidgets* pagePointer = &page;
+        openButton->Bind(wxEVT_BUTTON, [this, kind, pagePointer, index, openButton](wxCommandEvent&) {
+            if (IsPresetFilterColumn(kind, index)) ShowPresetFilterMenu(kind, *pagePointer, index, openButton);
+            else EditTextFilter(kind, *pagePointer, index);
+        });
+        closeButton->Bind(wxEVT_BUTTON, [this, kind, pagePointer, index](wxCommandEvent&) {
+            pagePointer->filters.erase(index);
+            pagePointer->valueFilters.erase(index);
+            const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
+            RefreshListView(kind, *pagePointer, mods);
+            CallAfter([this, kind, pagePointer]() { RefreshFilterBar(kind, *pagePointer); });
+        });
+    }
+
+    auto* addButton = new wxButton(page.filterBar, wxID_ANY, "Add filter", wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+    addButton->SetBitmap(wxArtProvider::GetBitmap(wxART_PLUS, wxART_BUTTON, wxSize(14, 14)));
+    addButton->Bind(wxEVT_BUTTON, [this, kind, pagePointer = &page, addButton](wxCommandEvent&) {
+        ShowAddFilterMenu(kind, *pagePointer, addButton);
+    });
+    page.filterSizer->Add(addButton, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+    page.filterBar->FitInside();
+    page.filterBar->Layout();
+}
+
+void MainFrame::PopulatePresetFilterMenu(wxMenu& menu, PageKind kind, PageWidgets& page, int column) {
+    const auto options = page.presetOptions.find(column);
+    if (options == page.presetOptions.end() || options->second.empty()) {
+        menu.Append(wxID_ANY, "No values available")->Enable(false);
+        return;
+    }
+    const auto selected = page.valueFilters.find(column);
+    static std::atomic<int> nextMenuId{15000};
+    for (const auto& option : options->second) {
+        const int id = nextMenuId.fetch_add(1);
+        auto* item = menu.AppendCheckItem(id, option.second);
+        if (selected != page.valueFilters.end() && selected->second.count(option.first)) item->Check(true);
+        menu.Bind(wxEVT_MENU, [this, kind, pagePointer = &page, column, key = option.first](wxCommandEvent& event) {
+            OnPresetFilterChanged(kind, *pagePointer, column, key, event.IsChecked());
+        }, id);
+    }
+}
+
+void MainFrame::ShowPresetFilterMenu(PageKind kind, PageWidgets& page, int column, wxWindow* parent) {
+    wxMenu menu;
+    PopulatePresetFilterMenu(menu, kind, page, column);
+    parent->PopupMenu(&menu);
+}
+
+void MainFrame::OnPresetFilterChanged(PageKind kind, PageWidgets& page, int column,
+                                      const std::string& key, bool enabled) {
+    auto& selected = page.valueFilters[column];
+    if (enabled) selected.insert(key);
+    else selected.erase(key);
+    if (selected.empty()) page.valueFilters.erase(column);
+    const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
+    RefreshListView(kind, page, mods);
+    PageWidgets* pagePointer = &page;
+    CallAfter([this, kind, pagePointer]() { RefreshFilterBar(kind, *pagePointer); });
+}
+
+void MainFrame::ShowAddFilterMenu(PageKind kind, PageWidgets& page, wxWindow* parent) {
+    wxMenu menu;
+    static std::atomic<int> nextMenuId{25000};
+    for (size_t column = 0; column < page.columnTitles.size(); ++column) {
+        const int index = static_cast<int>(column);
+        if (IsPresetFilterColumn(kind, index)) {
+            auto* submenu = new wxMenu();
+            PopulatePresetFilterMenu(*submenu, kind, page, index);
+            menu.AppendSubMenu(submenu, page.columnTitles[index]);
+        } else {
+            const int id = nextMenuId.fetch_add(1);
+            menu.Append(id, "Filter " + page.columnTitles[index] + "...");
+            menu.Bind(wxEVT_MENU, [this, kind, pagePointer = &page, index](wxCommandEvent&) {
+                EditTextFilter(kind, *pagePointer, index);
+            }, id);
+        }
+    }
+    parent->PopupMenu(&menu);
+}
+
+void MainFrame::EditTextFilter(PageKind kind, PageWidgets& page, int column) {
+    const auto current = page.filters.find(column);
+    const wxString initial = current == page.filters.end() ? wxString{} : current->second;
+    wxTextEntryDialog dialog(this, "Show rows where this column contains:",
+                             "Filter: " + page.columnTitles[column], initial);
+    if (dialog.ShowModal() != wxID_OK) return;
+    const wxString value = dialog.GetValue().Lower();
+    if (value.empty()) page.filters.erase(column);
+    else page.filters[column] = value;
+    const auto& mods = kind == PageKind::UserMods ? m_scanResults.userMods : m_scanResults.workshopMods;
+    RefreshListView(kind, page, mods);
+    PageWidgets* pagePointer = &page;
+    CallAfter([this, kind, pagePointer]() { RefreshFilterBar(kind, *pagePointer); });
 }
 
 void MainFrame::OnJobDone(wxThreadEvent& event) {
@@ -1443,6 +1837,7 @@ void MainFrame::PopulateList(PageKind kind, PageWidgets& page, const std::vector
             if (filter->second.empty()) page.valueFilters.erase(filter);
         }
     }
+    RefreshFilterBar(kind, page);
     RefreshListView(kind, page, mods);
 
     if (kind == PageKind::UserMods) {
@@ -1506,16 +1901,29 @@ void MainFrame::RefreshListView(PageKind kind, PageWidgets& page, const std::vec
             page.list->SetItem(row, static_cast<int>(col), ColumnValue(kind, mod, static_cast<int>(col)));
         page.list->SetItemData(row, static_cast<wxUIntPtr>(sourceIndex));
     }
-    // Requested arrow convention: down = ascending, up = descending.
     for (size_t col = 0; col < page.columnTitles.size(); ++col) {
-        wxString title = page.columnTitles[col];
-        if (static_cast<int>(col) == page.sortColumn)
-            title += page.sortAscending ? " ↓" : " ↑";
         wxListItem item;
         item.SetMask(wxLIST_MASK_TEXT);
-        item.SetText(title);
+        item.SetText(page.columnTitles[col]);
         page.list->SetColumn(static_cast<int>(col), item);
     }
+#ifdef _WIN32
+    const HWND header = reinterpret_cast<HWND>(::SendMessageW(
+        reinterpret_cast<HWND>(page.list->GetHandle()), LVM_GETHEADER, 0, 0));
+    if (header) {
+        for (size_t col = 0; col < page.columnTitles.size(); ++col) {
+            HDITEMW headerItem{};
+            headerItem.mask = HDI_FORMAT;
+            if (!::SendMessageW(header, HDM_GETITEMW, static_cast<WPARAM>(col),
+                                reinterpret_cast<LPARAM>(&headerItem))) continue;
+            headerItem.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+            if (static_cast<int>(col) == page.sortColumn)
+                headerItem.fmt |= page.sortAscending ? HDF_SORTUP : HDF_SORTDOWN;
+            ::SendMessageW(header, HDM_SETITEMW, static_cast<WPARAM>(col),
+                           reinterpret_cast<LPARAM>(&headerItem));
+        }
+    }
+#endif
     page.list->Thaw();
 }
 
@@ -1699,6 +2107,7 @@ void MainFrame::ShowArchiveNotification(const pzmm::fs::path& archivePath) {
 
     auto* buttonSizer = new wxBoxSizer(wxHORIZONTAL);
     auto* openButton = new wxButton(&dialog, wxID_OPEN, "Show ZIP in Explorer");
+    openButton->SetBitmap(wxArtProvider::GetBitmap(wxART_FILE_OPEN, wxART_BUTTON, wxSize(16, 16)));
     auto* closeButton = new wxButton(&dialog, wxID_CLOSE, "Close");
     buttonSizer->Add(openButton, 0, wxRIGHT, 8);
     buttonSizer->Add(closeButton, 0);

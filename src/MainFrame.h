@@ -17,6 +17,7 @@
 #include <wx/thread.h>
 #include <wx/gauge.h>
 #include <wx/timer.h>
+#include <wx/scrolwin.h>
 
 wxDECLARE_EVENT(wxEVT_PZMM_JOB_DONE, wxThreadEvent);
 wxDECLARE_EVENT(wxEVT_PZMM_PROGRESS, wxThreadEvent);
@@ -34,6 +35,8 @@ private:
         wxListCtrl* list = nullptr;
         wxStaticBitmap* poster = nullptr;
         wxTextCtrl* details = nullptr;
+        wxScrolledWindow* filterBar = nullptr;
+        wxBoxSizer* filterSizer = nullptr;
         std::vector<size_t> visibleIndices;
         int sortColumn = 0;
         bool sortAscending = true;
@@ -78,11 +81,8 @@ private:
     void ReportProgress(const std::string& message);
     void OnProgressPulse(wxTimerEvent& event);
     void OnSelectionSettled(wxTimerEvent& event);
+    void OnSystemColourChanged(wxSysColourChangedEvent& event);
     void OnColumnClick(PageKind kind, wxListEvent& event);
-    void OnColumnRightClick(PageKind kind, wxListEvent& event);
-    void OnColumnFilter(PageKind kind, wxListEvent& event);
-    void OnApplyTypedFilter(PageKind kind, wxListEvent& event);
-    void OnClearTypedFilter(PageKind kind, wxListEvent& event);
     void OnListRightClick(PageKind kind, wxListEvent& event);
     void OnBrowseUserPath(wxCommandEvent& event);
     void OnBrowseWorkshopPath(wxCommandEvent& event);
@@ -93,6 +93,7 @@ private:
     void OnUpdateUserSelected(wxCommandEvent& event);
     void OnListSelection(PageKind kind, wxListEvent& event);
     void OnRefresh(wxCommandEvent& event);
+    void ApplySystemTheme();
 
     void PopulateAllLists();
     void PopulateList(PageKind kind, PageWidgets& page, const std::vector<pzmm::ModEntry>& mods);
@@ -102,6 +103,13 @@ private:
     std::vector<std::pair<std::string, wxString>> PresetFilterOptions(PageKind kind, int column) const;
     bool MatchesPresetFilter(PageKind kind, const pzmm::ModEntry& mod, int column,
                              const std::set<std::string>& selected) const;
+    void RefreshFilterBar(PageKind kind, PageWidgets& page);
+    void ShowPresetFilterMenu(PageKind kind, PageWidgets& page, int column, wxWindow* parent);
+    void PopulatePresetFilterMenu(wxMenu& menu, PageKind kind, PageWidgets& page, int column);
+    void OnPresetFilterChanged(PageKind kind, PageWidgets& page, int column,
+                               const std::string& key, bool enabled);
+    void ShowAddFilterMenu(PageKind kind, PageWidgets& page, wxWindow* parent);
+    void EditTextFilter(PageKind kind, PageWidgets& page, int column);
     void UpdateDetails(PageKind kind, long row);
     wxString DescribeMod(const pzmm::ModEntry& entry, PageKind kind) const;
     void SetPoster(PageWidgets& page, const pzmm::fs::path& path);
